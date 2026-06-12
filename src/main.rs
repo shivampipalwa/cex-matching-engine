@@ -1,17 +1,22 @@
 use std::collections::{BTreeMap, VecDeque};
 
+use inline_string::InlineString;
+
+#[derive(Clone, Copy)]
 enum Side {
     Bid, // Buy
     Ask, // Sell
 }
 
+#[derive(Clone, Copy)]
 enum OrderType {
     Market, // execute immediately at the best available price
     Limit,  // execute at a specific price or better
 }
 
+#[derive(Clone, Copy)]
 struct Order {
-    id: String,
+    id: InlineString<32>,
     order_type: OrderType,
     side: Side,
     price: u64,
@@ -30,41 +35,75 @@ struct OrderBook {
 
 impl OrderBook {
     fn add_order(&mut self, order: &mut Order) -> u64 {
-        match order.order_type {
-            OrderType::Market => match order.side {
+        while order.remaining_size > 0 {
+            // get the queue for bid/ask orders with best price
+            let mut best_price_queue = match order.side {
                 Side::Bid => {
-                    while !self.asks.is_empty() && order.remaining_size > 0 {
-                        // get the queue for ask orders with lowest price
-                        let (&lowest_ask_price, _) = self.asks.first_key_value().unwrap();
-                        let mut lowest_ask_queue = self.asks.get_mut(&lowest_ask_price).unwrap();
-
-                        while !lowest_ask_queue.is_empty() && order.remaining_size > 0 {
-                            if let Some(lowest_ask_order) = lowest_ask_queue.front_mut() {
-                                if order.remaining_size <= lowest_ask_order.remaining_size {
-                                    lowest_ask_order.remaining_size -= order.remaining_size;
-                                    order.remaining_size = 0;
-                                } else {
-                                    order.remaining_size -= lowest_ask_order.remaining_size;
-                                    lowest_ask_order.remaining_size = 0;
-                                }
-                                // remove ask order from queue if it is filled
-                                if lowest_ask_order.remaining_size == 0 {
-                                    lowest_ask_queue.pop_front();
-                                }
-                            }
-                        }
-                        // remove first entry in map if its empty
-                        if lowest_ask_queue.is_empty() {
-                            self.asks.pop_first();
-                        }
-                    }
-                    // handle when remaining size is more than 0
-                    order.remaining_size
+                    let Some((&lowest_ask_price, _)) = self.asks.first_key_value() else {
+                        break;
+                    };
+                    self.asks.entry(lowest_ask_price).or_insert_with(|| {
+                        unreachable!("self.asks is guaranteed to have this price")
+                    })
                 }
-                Side::Ask => {}
-            },
-            OrderType::Limit => {}
+                Side::Ask => {
+                    let Some((&highest_bid_price, _)) = self.bids.last_key_value() else {
+                        break;
+                    };
+                    self.bids.entry(highest_bid_price).or_insert_with(|| {
+                        unreachable!("self.asks is guaranteed to have this price")
+                    })
+                }
+            };
+
+            while !best_price_queue.is_empty() && order.remaining_size > 0 {
+                if let Some(best_price_order) = best_price_queue.front_mut() {
+                    if order.remaining_size <= best_price_order.remaining_size {
+                        best_price_order.remaining_size -= order.remaining_size;
+                        order.remaining_size = 0;
+                    } else {
+                        order.remaining_size -= best_price_order.remaining_size;
+                        best_price_order.remaining_size = 0;
+                    }
+                    // remove ask order from queue if it is filled
+                    if best_price_order.remaining_size == 0 {
+                        best_price_queue.pop_front();
+                    }
+                }
+            }
+            // remove first entry in map if its empty
+            if best_price_queue.is_empty() {
+                match order.side {
+                    Side::Bid => {
+                        self.asks.pop_first();
+                    }
+                    Side::Ask => {
+                        self.bids.pop_first();
+                    }
+                }
+            }
         }
+        // handle when remaining size is more than 0
+        if order.remaining_size > 0 {
+            match order.order_type {
+                OrderType::Limit => match order.side {
+                    Side::Ask => {
+                        self.asks
+                            .entry(order.price)
+                            .or_insert(VecDeque::new())
+                            .push_back(*order);
+                    }
+                    Side::Bid => {
+                        self.bids
+                            .entry(order.price)
+                            .or_insert(VecDeque::new())
+                            .push_back(*order);
+                    }
+                },
+                OrderType::Market => {}
+            }
+        }
+        order.remaining_size
     }
 }
 
