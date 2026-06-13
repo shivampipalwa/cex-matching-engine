@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 inline_string = "0.1.2"
+rand = "0.10.1"
