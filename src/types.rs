@@ -1,3 +1,5 @@
+use tokio::sync::oneshot;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Side {
     Bid, // Buy
@@ -18,4 +20,15 @@ pub struct Order {
     pub price: u64,
     pub size: u64,
     pub remaining_size: u64,
+}
+
+pub enum EngineMessage {
+    AddOrder {
+        order: Order,
+        response_tx: oneshot::Sender<u64>,
+    },
+    CancelOrder {
+        order_id: u64,
+        response_tx: oneshot::Sender<bool>,
+    },
 }

@@ -1,10 +1,11 @@
-use crate::types::{Order, OrderType, Side};
+use crate::types::{EngineMessage, Order, OrderType, Side};
 use rand::{RngExt, rng};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use tokio::sync::mpsc;
 
 impl Order {
-    fn new(order_type: OrderType, side: Side, price: u64, size: u64) -> Order {
-        let rnd = rng();
+    pub fn new(order_type: OrderType, side: Side, price: u64, size: u64) -> Order {
+        let _ = rng();
         let mut id: u64 = rng().random();
         match side {
             Side::Bid => {
@@ -30,16 +31,18 @@ impl Order {
 // value = queue of orders
 // Used btreemap to keep the orders sorted by price
 #[derive(Debug)]
-struct OrderBook {
-    bids: BTreeMap<u64, VecDeque<Order>>,
-    asks: BTreeMap<u64, VecDeque<Order>>,
-    order_price_map: HashMap<u64, u64>,
+pub struct OrderBook {
+    pub bids: BTreeMap<u64, VecDeque<Order>>,
+    pub asks: BTreeMap<u64, VecDeque<Order>>,
+    pub order_price_map: HashMap<u64, u64>,
 }
 
 impl OrderBook {
+    // returns filled quantity
     fn add_order(&mut self, order: &mut Order) -> u64 {
         while order.remaining_size > 0 {
             // get the queue for bid/ask orders with best price
+
             let best_price_queue = match order.side {
                 Side::Bid => {
                     let Some((&lowest_ask_price, _)) = self.asks.first_key_value() else {
@@ -116,17 +119,17 @@ impl OrderBook {
                 self.order_price_map.insert(order.id, order.price);
             }
         }
-        order.remaining_size
+        order.size - order.remaining_size
     }
 
-    fn cancel_order(&mut self, order_id: u64) {
+    fn cancel_order(&mut self, order_id: u64) -> bool {
         let side_bit = (order_id >> 63) & 1;
 
         println!("ORDER ID: {}", order_id);
         println!("SIDE BIT: {}", side_bit);
 
         let Some(price) = self.order_price_map.get(&order_id) else {
-            return;
+            return false;
         };
 
         let Some(order_queue) = (match side_bit {
@@ -134,12 +137,14 @@ impl OrderBook {
             1 => self.asks.get_mut(price),
             _ => None,
         }) else {
-            return;
+            return false;
         };
 
         if let Some(index) = order_queue.iter().position(|&order| order.id == order_id) {
             let cancelled_order = order_queue.remove(index);
             println!("Removed: {:?}", cancelled_order);
+        } else {
+            return false;
         }
         if order_queue.is_empty() {
             if side_bit == 0 {
@@ -148,8 +153,40 @@ impl OrderBook {
                 self.asks.remove(price);
             }
         }
+        return true;
     }
 }
+
+// pub async fn run_engine(mut book: OrderBook, mut receiver: mpsc::Receiver<EngineMessage>) {
+//     while let Some(msg) = receiver.recv().await {
+//         match msg {
+//             EngineMessage::AddOrder {
+//                 mut order,
+//                 response_tx,
+//             } => {
+//                 let remaining = book.add_order(&mut order);
+//                 if let Err(e) = response_tx.send(remaining) {
+//                     println!(
+//                         "Oneshot reciever closed for Order: {:?};\nRequest Type: Add Order;\nErr: {}",
+//                         order, e
+//                     )
+//                 };
+//             }
+//             EngineMessage::CancelOrder {
+//                 order_id,
+//                 response_tx,
+//             } => {
+//                 let success = book.cancel_order(order_id);
+//                 if let Err(e) = response_tx.send(success) {
+//                     println!(
+//                         "Oneshot receiver closed for OrderId: {}\nRequest Type: Cancel Order;\nErr: {}\n",
+//                         order_id, e
+//                     )
+//                 }
+//             }
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -358,7 +395,7 @@ mod tests {
 #[cfg(test)]
 mod cancel_tests {
     use super::*;
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
 
     // --- HELPER FUNCTION ---
     // Update this to use your new auto-generating ID constructor.
