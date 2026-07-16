@@ -1,13 +1,12 @@
 use crate::types::{
-    AccountId, Balance, CancelRequest, Currency, DepositRequest, Engine, EngineMessage, Ledger,
-    MatchResponse, Order, OrderBook, OrderLocation, OrderRequest, OrderType, PlaceOrderResponse,
-    RejectReason, Side, Trade, WithdrawRequest,
+    AccountId, Balance, CancelRequest, Command, CommandEnvelope, CommandResponse, Currency, Engine,
+    Ledger, MatchResponse, Order, OrderBook, OrderLocation, OrderRequest, OrderType,
+    PlaceOrderResponse, RejectReason, Side, Trade,
 };
-use std::{
-    cmp::min,
-    collections::{BTreeMap, HashMap, VecDeque},
-};
-use tokio::sync::mpsc;
+use redis::{AsyncCommands, aio::MultiplexedConnection};
+use std::{cmp::min, collections::VecDeque, error::Error};
+
+use redis::streams::{StreamReadOptions, StreamReadReply};
 
 impl OrderBook {
     // returns filled quantity
@@ -21,8 +20,6 @@ impl OrderBook {
             size: order_request.size,
             remaining_size: order_request.size,
         };
-
-        // println!("{:?}", self);
 
         let mut trades = vec![];
 
@@ -237,7 +234,7 @@ impl Ledger {
                 let takers_base_balance = takers_balance.entry(currency).or_default();
                 takers_base_balance.available += trade.qty;
 
-                //update maker;s ledger
+                //update maker's ledger
                 let makers_balance = self.balances.entry(trade.maker_account).or_default();
                 let makers_quote_balance = makers_balance.entry(Currency::USD).or_default();
                 makers_quote_balance.available += trade.price * trade.qty; //overflow
@@ -320,83 +317,105 @@ impl Engine {
     }
 }
 
-pub async fn run_engine(mut engine: Engine, mut receiver: mpsc::Receiver<EngineMessage>) {
-    while let Some(msg) = receiver.recv().await {
-        match msg {
-            EngineMessage::AddOrder {
-                order_request,
-                response_tx,
-            } => {
-                let place_order_res = engine.place_order(&order_request);
-                let Ok(match_response) = place_order_res else {
-                    let e = place_order_res.unwrap_err();
-                    if let Err(e) = response_tx.send(Err(e)) {
-                        println!(
-                            "Oneshot reciever closed for Order: {:?};\nRequest Type: Add Order;\nErr: {:?}",
-                            order_request, e
-                        )
-                    }
+pub async fn run_engine(
+    mut engine: Engine,
+    mut read_conn: MultiplexedConnection,
+    mut pub_conn: MultiplexedConnection,
+) -> Result<(), Box<dyn Error>> {
+    let opts = StreamReadOptions::default()
+        .group("engine-group", "engine-1")
+        .block(5000)
+        .count(10);
+    loop {
+        let reply: StreamReadReply = read_conn
+            .xread_options(&["commands"], &[">"], &opts)
+            .await?;
+
+        for key in reply.keys {
+            for entry in key.ids {
+                let entry_id = entry.id.clone();
+                let Some(data): Option<String> = entry.get("data") else {
+                    println!("Empty data");
+                    let _: i64 = pub_conn
+                        .xack("commands", "engine-group", &[entry_id])
+                        .await?;
                     continue;
                 };
-                let response = PlaceOrderResponse {
-                    order_id: match_response.order_id,
-                    filled_qty: match_response.trades.iter().map(|t| t.qty).sum(),
-                    total_cost: match_response.trades.iter().map(|t| t.qty * t.price).sum(),
+                let Ok(CommandEnvelope {
+                    correlation_id,
+                    command,
+                }) = serde_json::from_str(&data).inspect_err(|err| {
+                    println!("Could not deserialize CommandEnvelope; Err:\n{}", err);
+                })
+                else {
+                    let _: i64 = pub_conn
+                        .xack("commands", "engine-group", &[entry_id])
+                        .await?;
+                    continue;
                 };
-                if let Err(e) = response_tx.send(Ok(response)) {
-                    println!(
-                        "Oneshot reciever closed for Order: {:?};\nRequest Type: Add Order;\nErr: {:?}",
-                        order_request, e
-                    )
-                };
-            }
-
-            EngineMessage::CancelOrder {
-                cancel_request,
-                response_tx,
-            } => {
-                let success = engine.cancel_order(&cancel_request);
-                if let Err(e) = response_tx.send(success) {
-                    println!(
-                        "Oneshot receiver closed for CancelRequest: {:?};\nErr: {}\n",
-                        cancel_request, e
-                    )
+                let Ok(resp_json) = match command {
+                    Command::Place(order_request) => {
+                        let place_order_res = engine.place_order(&order_request);
+                        if let Ok(match_response) = place_order_res {
+                            let response = PlaceOrderResponse {
+                                order_id: match_response.order_id,
+                                filled_qty: match_response.trades.iter().map(|t| t.qty).sum(),
+                                total_cost: match_response
+                                    .trades
+                                    .iter()
+                                    .map(|t| t.qty * t.price)
+                                    .sum(),
+                            };
+                            serde_json::to_string(&CommandResponse::Place(Ok(response)))
+                        } else {
+                            let e = place_order_res.unwrap_err();
+                            serde_json::to_string(&CommandResponse::Place(Err(e)))
+                        }
+                    }
+                    Command::Cancel(cancel_request) => {
+                        let success = engine.cancel_order(&cancel_request);
+                        serde_json::to_string(&CommandResponse::Cancel(success))
+                    }
+                    Command::Deposit(deposit_request) => {
+                        let available_balance = engine.ledger.deposit(
+                            deposit_request.currency,
+                            deposit_request.account_id,
+                            deposit_request.amount,
+                        );
+                        serde_json::to_string(&CommandResponse::Deposit(available_balance))
+                    }
+                    Command::Withdraw(withdraw_request) => {
+                        let res = engine
+                            .ledger
+                            .withdraw(withdraw_request.account_id, withdraw_request.amount);
+                        serde_json::to_string(&CommandResponse::Withdraw(res))
+                    }
                 }
-            }
-
-            EngineMessage::DepositUsd {
-                deposit_request,
-                response_tx,
-            } => {
-                let available_balance = engine.ledger.deposit(
-                    deposit_request.currency,
-                    deposit_request.account_id,
-                    deposit_request.amount,
-                );
-                if let Err(e) = response_tx.send(available_balance) {
-                    println!(
-                        "Oneshot receiver closed for DepositRequest: {:?};\nErr: {}\n",
-                        deposit_request, e
-                    )
-                }
-            }
-
-            EngineMessage::WithdrawUsd {
-                withdraw_request,
-                response_tx,
-            } => {
-                let res = engine
-                    .ledger
-                    .withdraw(withdraw_request.account_id, withdraw_request.amount);
-                if let Err(e) = response_tx.send(res) {
-                    println!(
-                        "Oneshot reciever closed for WithdrawRequest: {:?};\nErr: {:?}",
-                        withdraw_request, e
-                    )
+                .inspect_err(|err| {
+                    println!("Could not serialize Response; Err:\n{}", err);
+                }) else {
+                    let _: i64 = pub_conn
+                        .xack("commands", "engine-group", &[entry_id])
+                        .await?;
+                    continue;
                 };
+                let channel = format!("result:{}", correlation_id);
+                let _: Result<i64, redis::RedisError> = pub_conn
+                    .publish(channel, &resp_json)
+                    .await
+                    .inspect_err(|err| {
+                        println!(
+                            "Could not publish response;\nresp_json: {}\nErr: {}",
+                            resp_json, err
+                        );
+                    });
+                let _: i64 = pub_conn
+                    .xack("commands", "engine-group", &[entry_id])
+                    .await?;
             }
         }
     }
+    // Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +429,8 @@ pub async fn run_engine(mut engine: Engine, mut receiver: mpsc::Receiver<EngineM
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod test_util {
+    use std::collections::{BTreeMap, HashMap};
+
     use super::*;
 
     pub fn new_book() -> OrderBook {
