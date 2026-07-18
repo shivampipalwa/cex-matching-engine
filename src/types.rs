@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -32,7 +35,7 @@ pub struct OrderLocation {
     pub price: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct Trade {
     pub price: u64,
     pub qty: u64,
@@ -123,6 +126,7 @@ pub struct Balance {
 #[derive(Debug)]
 pub struct Ledger {
     pub balances: HashMap<AccountId, HashMap<Currency, Balance>>,
+    pub dirty: HashSet<(AccountId, Currency)>,
 }
 
 #[derive(Debug)]
@@ -148,6 +152,38 @@ pub enum RejectReason {
     InsufficientFunds,
     UnsupportedOrderType,
     InvalidAmount,
+}
+
+// output event stream from engine for db writer, etc.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Event {
+    Trade(Trade),
+    BalanceChanged {
+        account_id: AccountId,
+        currency: Currency,
+        available: u64,
+        reserved: u64,
+    },
+    OrderAccepted {
+        order_id: u64,
+        account_id: AccountId,
+        side: Side,
+        order_type: OrderType,
+        price: u64,
+        size: u64,
+    },
+    OrderCancelled {
+        order_id: u64,
+    },
+}
+
+impl fmt::Display for Currency {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Currency::USD => write!(f, "USD"),
+            Currency::SOL => write!(f, "SOL"),
+        }
+    }
 }
 
 #[cfg(test)]

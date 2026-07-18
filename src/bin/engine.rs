@@ -3,7 +3,7 @@ use matching_engine::{
     types::{Engine, Ledger, OrderBook},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
 };
 
@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
         ledger: Ledger {
             balances: HashMap::new(),
+            dirty: HashSet::new(),
         },
     };
 

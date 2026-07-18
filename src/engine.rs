@@ -1,6 +1,6 @@
 use crate::types::{
     AccountId, Balance, CancelRequest, Command, CommandEnvelope, CommandResponse, Currency, Engine,
-    Ledger, MatchResponse, Order, OrderBook, OrderLocation, OrderRequest, OrderType,
+    Event, Ledger, MatchResponse, Order, OrderBook, OrderLocation, OrderRequest, OrderType,
     PlaceOrderResponse, RejectReason, Side, Trade,
 };
 use redis::{AsyncCommands, aio::MultiplexedConnection, streams::StreamRangeReply};
@@ -168,6 +168,7 @@ impl Ledger {
             .entry(currency)
             .or_default();
         balance.available += amount;
+        self.dirty.insert((account_id, currency));
         balance.available
     }
 
@@ -181,6 +182,7 @@ impl Ledger {
             return Err(RejectReason::InsufficientFunds);
         }
         usd_balance.available -= amount;
+        self.dirty.insert((account_id, Currency::USD));
         Ok(())
     }
 
@@ -201,6 +203,7 @@ impl Ledger {
         }
         balance.available -= amount;
         balance.reserved += amount;
+        self.dirty.insert((account_id, currency));
         Ok(())
     }
 
@@ -221,6 +224,7 @@ impl Ledger {
         }
         balance.reserved -= amount;
         balance.available += amount;
+        self.dirty.insert((account_id, currency));
         Ok(())
     }
 
@@ -240,6 +244,12 @@ impl Ledger {
                 makers_quote_balance.available += trade.price * trade.qty; //overflow
                 let makers_base_balance = makers_balance.entry(currency).or_default();
                 makers_base_balance.reserved -= trade.qty;
+
+                // record dirty
+                self.dirty.insert((trade.taker_account, Currency::USD));
+                self.dirty.insert((trade.taker_account, currency));
+                self.dirty.insert((trade.maker_account, Currency::USD));
+                self.dirty.insert((trade.maker_account, currency));
             }
             Side::Ask => {
                 // update taker's ledger
@@ -255,8 +265,18 @@ impl Ledger {
                 makers_quote_balance.reserved -= trade.price * trade.qty; //overflow
                 let makers_base_balance = makers_balance.entry(currency).or_default();
                 makers_base_balance.available += trade.qty;
+
+                // record dirty
+                self.dirty.insert((trade.taker_account, Currency::USD));
+                self.dirty.insert((trade.taker_account, currency));
+                self.dirty.insert((trade.maker_account, Currency::USD));
+                self.dirty.insert((trade.maker_account, currency));
             }
         }
+    }
+
+    pub fn take_dirty(&mut self) -> Vec<(AccountId, Currency)> {
+        self.dirty.drain().collect()
     }
 }
 
@@ -317,6 +337,71 @@ impl Engine {
     }
 }
 
+pub fn apply(engine: &mut Engine, command: Command) -> (CommandResponse, Vec<Event>) {
+    let mut events = vec![];
+    let command_response = match command {
+        Command::Place(order_request) => {
+            let place_order_res = engine.place_order(&order_request);
+            if let Ok(match_response) = place_order_res {
+                let response = PlaceOrderResponse {
+                    order_id: match_response.order_id,
+                    filled_qty: match_response.trades.iter().map(|t| t.qty).sum(),
+                    total_cost: match_response.trades.iter().map(|t| t.qty * t.price).sum(),
+                };
+                match_response
+                    .trades
+                    .iter()
+                    .for_each(|t| events.push(Event::Trade(*t)));
+                events.push(Event::OrderAccepted {
+                    order_id: match_response.order_id,
+                    account_id: order_request.account_id,
+                    side: order_request.side,
+                    order_type: order_request.order_type,
+                    price: order_request.price,
+                    size: order_request.size,
+                });
+                CommandResponse::Place(Ok(response))
+            } else {
+                let e = place_order_res.unwrap_err();
+                CommandResponse::Place(Err(e))
+            }
+        }
+        Command::Cancel(cancel_request) => {
+            let success = engine.cancel_order(&cancel_request);
+            if success {
+                events.push(Event::OrderCancelled {
+                    order_id: cancel_request.order_id,
+                });
+            }
+            CommandResponse::Cancel(success)
+        }
+        Command::Deposit(deposit_request) => {
+            let available_balance = engine.ledger.deposit(
+                deposit_request.currency,
+                deposit_request.account_id,
+                deposit_request.amount,
+            );
+            CommandResponse::Deposit(available_balance)
+        }
+        Command::Withdraw(withdraw_request) => {
+            let res = engine
+                .ledger
+                .withdraw(withdraw_request.account_id, withdraw_request.amount);
+            CommandResponse::Withdraw(res)
+        }
+    };
+    for (account_id, currency) in engine.ledger.take_dirty() {
+        let b = &engine.ledger.balances[&account_id][&currency];
+        events.push(Event::BalanceChanged {
+            account_id,
+            currency,
+            available: b.available,
+            reserved: b.reserved,
+        });
+    }
+    return (command_response, events);
+}
+
 pub async fn recover(
     engine: &mut Engine,
     conn: &mut MultiplexedConnection,
@@ -357,43 +442,6 @@ pub async fn recover(
     }
 
     Ok(())
-}
-
-pub fn apply(engine: &mut Engine, command: Command) -> CommandResponse {
-    match command {
-        Command::Place(order_request) => {
-            let place_order_res = engine.place_order(&order_request);
-            if let Ok(match_response) = place_order_res {
-                let response = PlaceOrderResponse {
-                    order_id: match_response.order_id,
-                    filled_qty: match_response.trades.iter().map(|t| t.qty).sum(),
-                    total_cost: match_response.trades.iter().map(|t| t.qty * t.price).sum(),
-                };
-                CommandResponse::Place(Ok(response))
-            } else {
-                let e = place_order_res.unwrap_err();
-                CommandResponse::Place(Err(e))
-            }
-        }
-        Command::Cancel(cancel_request) => {
-            let success = engine.cancel_order(&cancel_request);
-            CommandResponse::Cancel(success)
-        }
-        Command::Deposit(deposit_request) => {
-            let available_balance = engine.ledger.deposit(
-                deposit_request.currency,
-                deposit_request.account_id,
-                deposit_request.amount,
-            );
-            CommandResponse::Deposit(available_balance)
-        }
-        Command::Withdraw(withdraw_request) => {
-            let res = engine
-                .ledger
-                .withdraw(withdraw_request.account_id, withdraw_request.amount);
-            CommandResponse::Withdraw(res)
-        }
-    }
 }
 
 pub async fn run_engine(
@@ -438,7 +486,19 @@ pub async fn run_engine(
                 };
 
                 // dispatch command
-                let resp = apply(&mut engine, command);
+                let (resp, events) = apply(&mut engine, command);
+
+                // emit events
+                for event in events {
+                    let Ok(event_json) = serde_json::to_string(&event).inspect_err(|err| {
+                        println!("Invalid event: {:?}\nErr: {}", event, err);
+                    }) else {
+                        continue;
+                    };
+                    let _: String = pub_conn
+                        .xadd("events", "*", &[("data".to_string(), event_json)])
+                        .await?;
+                }
 
                 // serialize resp
                 let Ok(resp_json) = serde_json::to_string(&resp).inspect_err(|err| {
@@ -483,7 +543,7 @@ pub async fn run_engine(
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod test_util {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use super::*;
 
@@ -503,6 +563,7 @@ mod test_util {
             book: new_book(),
             ledger: Ledger {
                 balances: HashMap::new(),
+                dirty: HashSet::new(),
             },
         }
     }

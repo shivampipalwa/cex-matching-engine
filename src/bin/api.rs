@@ -16,69 +16,69 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = redis::Client::open("redis://127.0.0.1:6379/")?;
     let mut xadd_conn = client.get_multiplexed_async_connection().await?; // for XADD
 
-    // let mut command = Command::Deposit(DepositRequest {
-    //     account_id: 2,
-    //     amount: 10,
-    //     currency: Currency::SOL,
-    // });
-    // let resp = send_command(&client, &mut xadd_conn, command).await;
-    // println!("{:?}", resp);
-
-    // let mut command = Command::Deposit(DepositRequest {
-    //     account_id: 1,
-    //     amount: 1000,
-    //     currency: Currency::USD,
-    // });
-    // let resp = send_command(&client, &mut xadd_conn, command).await;
-    // println!("{:?}", resp);
-
-    let mut command = Command::Withdraw(WithdrawRequest {
-        account_id: 1,
-        amount: 1000,
+    let mut command = Command::Deposit(DepositRequest {
+        account_id: 2,
+        amount: 10,
+        currency: Currency::SOL,
     });
     let resp = send_command(&client, &mut xadd_conn, command).await;
     println!("{:?}", resp);
 
-    // command = Command::Place(OrderRequest {
-    //     account_id: 2,
-    //     base_currency: Currency::SOL,
-    //     order_type: Limit,
-    //     side: Side::Ask,
-    //     price: 100,
-    //     size: 10,
-    // });
-    // let resp = send_command(&client, &mut xadd_conn, command).await;
-    // println!("{:?}", resp);
+    command = Command::Deposit(DepositRequest {
+        account_id: 1,
+        amount: 1000,
+        currency: Currency::USD,
+    });
+    let resp = send_command(&client, &mut xadd_conn, command).await;
+    println!("{:?}", resp);
 
-    // command = Command::Place(OrderRequest {
+    // command = Command::Withdraw(WithdrawRequest {
     //     account_id: 1,
-    //     base_currency: Currency::SOL,
-    //     order_type: Limit,
-    //     side: Side::Bid,
-    //     price: 100,
-    //     size: 10,
-    // });
-
-    // let resp = send_command(&client, &mut xadd_conn, command).await;
-    // println!("{:?}", resp);
-
-    // command = Command::Place(OrderRequest {
-    //     account_id: 1,
-    //     base_currency: Currency::SOL,
-    //     order_type: Market,
-    //     side: Side::Bid,
-    //     price: 100,
-    //     size: 10,
+    //     amount: 1000,
     // });
     // let resp = send_command(&client, &mut xadd_conn, command).await;
     // println!("{:?}", resp);
 
-    // command = Command::Cancel(CancelRequest {
-    //     order_id: 999,
-    //     base_currency: Currency::SOL,
-    // });
-    // let resp = send_command(&client, &mut xadd_conn, command).await;
-    // println!("{:?}", resp);
+    command = Command::Place(OrderRequest {
+        account_id: 2,
+        base_currency: Currency::SOL,
+        order_type: Limit,
+        side: Side::Ask,
+        price: 100,
+        size: 10,
+    });
+    let resp = send_command(&client, &mut xadd_conn, command).await;
+    println!("{:?}", resp);
+
+    command = Command::Place(OrderRequest {
+        account_id: 1,
+        base_currency: Currency::SOL,
+        order_type: Limit,
+        side: Side::Bid,
+        price: 100,
+        size: 10,
+    });
+
+    let resp = send_command(&client, &mut xadd_conn, command).await;
+    println!("{:?}", resp);
+
+    command = Command::Place(OrderRequest {
+        account_id: 1,
+        base_currency: Currency::SOL,
+        order_type: Market,
+        side: Side::Bid,
+        price: 100,
+        size: 10,
+    });
+    let resp = send_command(&client, &mut xadd_conn, command).await;
+    println!("{:?}", resp);
+
+    command = Command::Cancel(CancelRequest {
+        order_id: 999,
+        base_currency: Currency::SOL,
+    });
+    let resp = send_command(&client, &mut xadd_conn, command).await;
+    println!("{:?}", resp);
 
     Ok(())
 }
