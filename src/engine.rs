@@ -3,7 +3,7 @@ use crate::types::{
     Ledger, MatchResponse, Order, OrderBook, OrderLocation, OrderRequest, OrderType,
     PlaceOrderResponse, RejectReason, Side, Trade,
 };
-use redis::{AsyncCommands, aio::MultiplexedConnection};
+use redis::{AsyncCommands, aio::MultiplexedConnection, streams::StreamRangeReply};
 use std::{cmp::min, collections::VecDeque, error::Error};
 
 use redis::streams::{StreamReadOptions, StreamReadReply};
@@ -317,11 +317,91 @@ impl Engine {
     }
 }
 
+pub async fn recover(
+    engine: &mut Engine,
+    conn: &mut MultiplexedConnection,
+) -> Result<(), Box<dyn Error>> {
+    println!("Starting Recovery");
+    let reply: StreamRangeReply = conn.xrange("commands", "-", "+").await?;
+    let mut last_id = None;
+    for id in reply.ids {
+        // get command data
+        let Some(data): Option<String> = id.get("data") else {
+            println!("Empty data");
+            continue;
+        };
+
+        // deserialize data into CommandEnvelope (correlation_id is irrelevant
+        // during replay — we emit nothing, so there's no one to reply to)
+        let Ok(CommandEnvelope { command, .. }) = serde_json::from_str(&data).inspect_err(|err| {
+            println!("Could not deserialize CommandEnvelope; Err:\n{}", err);
+        }) else {
+            continue;
+        };
+
+        // dispatch command and discard response
+        let _ = apply(engine, command);
+        last_id = Some(id);
+    }
+    println!("Recovery complete");
+
+    // align the group cursor to the replay boundary
+    if let Some(stream_id) = last_id {
+        let _: redis::RedisResult<()> = redis::cmd("XGROUP")
+            .arg("SETID")
+            .arg("commands")
+            .arg("engine-group")
+            .arg(stream_id.id)
+            .query_async(conn)
+            .await;
+    }
+
+    Ok(())
+}
+
+pub fn apply(engine: &mut Engine, command: Command) -> CommandResponse {
+    match command {
+        Command::Place(order_request) => {
+            let place_order_res = engine.place_order(&order_request);
+            if let Ok(match_response) = place_order_res {
+                let response = PlaceOrderResponse {
+                    order_id: match_response.order_id,
+                    filled_qty: match_response.trades.iter().map(|t| t.qty).sum(),
+                    total_cost: match_response.trades.iter().map(|t| t.qty * t.price).sum(),
+                };
+                CommandResponse::Place(Ok(response))
+            } else {
+                let e = place_order_res.unwrap_err();
+                CommandResponse::Place(Err(e))
+            }
+        }
+        Command::Cancel(cancel_request) => {
+            let success = engine.cancel_order(&cancel_request);
+            CommandResponse::Cancel(success)
+        }
+        Command::Deposit(deposit_request) => {
+            let available_balance = engine.ledger.deposit(
+                deposit_request.currency,
+                deposit_request.account_id,
+                deposit_request.amount,
+            );
+            CommandResponse::Deposit(available_balance)
+        }
+        Command::Withdraw(withdraw_request) => {
+            let res = engine
+                .ledger
+                .withdraw(withdraw_request.account_id, withdraw_request.amount);
+            CommandResponse::Withdraw(res)
+        }
+    }
+}
+
 pub async fn run_engine(
     mut engine: Engine,
     mut read_conn: MultiplexedConnection,
     mut pub_conn: MultiplexedConnection,
 ) -> Result<(), Box<dyn Error>> {
+    recover(&mut engine, &mut pub_conn).await?;
     let opts = StreamReadOptions::default()
         .group("engine-group", "engine-1")
         .block(5000)
@@ -334,6 +414,8 @@ pub async fn run_engine(
         for key in reply.keys {
             for entry in key.ids {
                 let entry_id = entry.id.clone();
+
+                // get command data
                 let Some(data): Option<String> = entry.get("data") else {
                     println!("Empty data");
                     let _: i64 = pub_conn
@@ -341,6 +423,7 @@ pub async fn run_engine(
                         .await?;
                     continue;
                 };
+                // deserialize to CommandEnvelope
                 let Ok(CommandEnvelope {
                     correlation_id,
                     command,
@@ -353,45 +436,12 @@ pub async fn run_engine(
                         .await?;
                     continue;
                 };
-                let Ok(resp_json) = match command {
-                    Command::Place(order_request) => {
-                        let place_order_res = engine.place_order(&order_request);
-                        if let Ok(match_response) = place_order_res {
-                            let response = PlaceOrderResponse {
-                                order_id: match_response.order_id,
-                                filled_qty: match_response.trades.iter().map(|t| t.qty).sum(),
-                                total_cost: match_response
-                                    .trades
-                                    .iter()
-                                    .map(|t| t.qty * t.price)
-                                    .sum(),
-                            };
-                            serde_json::to_string(&CommandResponse::Place(Ok(response)))
-                        } else {
-                            let e = place_order_res.unwrap_err();
-                            serde_json::to_string(&CommandResponse::Place(Err(e)))
-                        }
-                    }
-                    Command::Cancel(cancel_request) => {
-                        let success = engine.cancel_order(&cancel_request);
-                        serde_json::to_string(&CommandResponse::Cancel(success))
-                    }
-                    Command::Deposit(deposit_request) => {
-                        let available_balance = engine.ledger.deposit(
-                            deposit_request.currency,
-                            deposit_request.account_id,
-                            deposit_request.amount,
-                        );
-                        serde_json::to_string(&CommandResponse::Deposit(available_balance))
-                    }
-                    Command::Withdraw(withdraw_request) => {
-                        let res = engine
-                            .ledger
-                            .withdraw(withdraw_request.account_id, withdraw_request.amount);
-                        serde_json::to_string(&CommandResponse::Withdraw(res))
-                    }
-                }
-                .inspect_err(|err| {
+
+                // dispatch command
+                let resp = apply(&mut engine, command);
+
+                // serialize resp
+                let Ok(resp_json) = serde_json::to_string(&resp).inspect_err(|err| {
                     println!("Could not serialize Response; Err:\n{}", err);
                 }) else {
                     let _: i64 = pub_conn
@@ -399,6 +449,8 @@ pub async fn run_engine(
                         .await?;
                     continue;
                 };
+
+                // publish response
                 let channel = format!("result:{}", correlation_id);
                 let _: Result<i64, redis::RedisError> = pub_conn
                     .publish(channel, &resp_json)
@@ -409,6 +461,8 @@ pub async fn run_engine(
                             resp_json, err
                         );
                     });
+
+                // ACK command
                 let _: i64 = pub_conn
                     .xack("commands", "engine-group", &[entry_id])
                     .await?;

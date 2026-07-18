@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -25,25 +24,6 @@ pub struct Order {
     pub size: u64,
     pub remaining_size: u64,
     pub account_id: AccountId,
-}
-
-pub enum EngineMessage {
-    AddOrder {
-        order_request: OrderRequest,
-        response_tx: oneshot::Sender<Result<PlaceOrderResponse, RejectReason>>,
-    },
-    CancelOrder {
-        cancel_request: CancelRequest,
-        response_tx: oneshot::Sender<bool>,
-    },
-    DepositUsd {
-        deposit_request: DepositRequest,
-        response_tx: oneshot::Sender<u64>,
-    },
-    WithdrawUsd {
-        withdraw_request: WithdrawRequest,
-        response_tx: oneshot::Sender<Result<(), RejectReason>>,
-    },
 }
 
 #[derive(Debug)]
