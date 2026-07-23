@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             balances: HashMap::new(),
             dirty: HashSet::new(),
         },
+        dedup: HashSet::new(),
     };
 
     run_engine(engine, read_conn, pub_conn).await?;

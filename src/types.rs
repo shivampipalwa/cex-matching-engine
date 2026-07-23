@@ -31,6 +31,7 @@ pub struct Order {
 
 #[derive(Debug)]
 pub struct OrderLocation {
+    pub owner: AccountId,
     pub side: Side,
     pub price: u64,
 }
@@ -57,12 +58,19 @@ pub enum Command {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommandEnvelope {
     pub correlation_id: Uuid,
+    pub account_id: AccountId,
+    pub client_order_id: u64,
     pub command: Command,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ResponseEnvelope {
+    pub correlation_id: Uuid,
+    pub response: CommandResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct OrderRequest {
-    pub account_id: AccountId,
     pub base_currency: Currency,
     pub order_type: OrderType,
     pub side: Side,
@@ -78,14 +86,12 @@ pub struct CancelRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DepositRequest {
-    pub account_id: AccountId,
     pub amount: u64,
     pub currency: Currency,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WithdrawRequest {
-    pub account_id: AccountId,
     pub amount: u64,
 }
 
@@ -95,6 +101,9 @@ pub enum CommandResponse {
     Cancel(bool),
     Deposit(u64),
     Withdraw(Result<(), RejectReason>),
+    // A (account_id, client_order_id) we've already applied — a lost-ack retry.
+    // No state was touched; the client reconciles the real outcome via query.
+    Duplicate,
 }
 
 #[derive(Debug)]
@@ -133,6 +142,7 @@ pub struct Ledger {
 pub struct Engine {
     pub book: OrderBook,
     pub ledger: Ledger,
+    pub dedup: HashSet<(AccountId, u64)>,
 }
 
 // Stores Orders in a BTreeMap as:
@@ -196,8 +206,9 @@ mod wire_tests {
     fn place_command_round_trips() {
         let env = CommandEnvelope {
             correlation_id: Uuid::nil(),
+            account_id: 7,
+            client_order_id: 42,
             command: Command::Place(OrderRequest {
-                account_id: 7,
                 base_currency: Currency::SOL,
                 order_type: OrderType::Limit,
                 side: Side::Bid,
@@ -210,9 +221,10 @@ mod wire_tests {
         let back: CommandEnvelope = serde_json::from_str(&json).unwrap();
 
         assert_eq!(back.correlation_id, Uuid::nil());
+        assert_eq!(back.account_id, 7);
+        assert_eq!(back.client_order_id, 42);
         match back.command {
             Command::Place(req) => {
-                assert_eq!(req.account_id, 7);
                 assert_eq!(req.side, Side::Bid);
                 assert_eq!(req.price, 100);
                 assert_eq!(req.size, 10);

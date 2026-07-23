@@ -1,7 +1,7 @@
 use crate::types::{
     AccountId, Balance, CancelRequest, Command, CommandEnvelope, CommandResponse, Currency, Engine,
     Event, Ledger, MatchResponse, Order, OrderBook, OrderLocation, OrderRequest, OrderType,
-    PlaceOrderResponse, RejectReason, Side, Trade,
+    PlaceOrderResponse, RejectReason, ResponseEnvelope, Side, Trade,
 };
 use redis::{AsyncCommands, aio::MultiplexedConnection, streams::StreamRangeReply};
 use std::{cmp::min, collections::VecDeque, error::Error};
@@ -10,10 +10,10 @@ use redis::streams::{StreamReadOptions, StreamReadReply};
 
 impl OrderBook {
     // returns filled quantity
-    fn add_order(&mut self, order_request: &OrderRequest) -> MatchResponse {
+    fn add_order(&mut self, account_id: AccountId, order_request: &OrderRequest) -> MatchResponse {
         let mut order = Order {
             id: self.next_order_id,
-            account_id: order_request.account_id,
+            account_id: account_id,
             order_type: order_request.order_type,
             side: order_request.side,
             price: order_request.price,
@@ -114,6 +114,7 @@ impl OrderBook {
                 self.order_index.insert(
                     order.id,
                     OrderLocation {
+                        owner: account_id,
                         side: order.side,
                         price: order.price,
                     },
@@ -126,10 +127,14 @@ impl OrderBook {
         }
     }
 
-    fn cancel_order(&mut self, order_id: u64) -> Option<Order> {
-        let Some(OrderLocation { side, price }) = self.order_index.get(&order_id) else {
+    fn cancel_order(&mut self, account_id: AccountId, order_id: u64) -> Option<Order> {
+        let Some(OrderLocation { owner, side, price }) = self.order_index.get(&order_id) else {
             return None;
         };
+
+        if account_id != *owner {
+            return None;
+        }
 
         let Some(order_queue) = (match side {
             Side::Bid => self.bids.get_mut(price),
@@ -281,7 +286,11 @@ impl Ledger {
 }
 
 impl Engine {
-    fn place_order(&mut self, req: &OrderRequest) -> Result<MatchResponse, RejectReason> {
+    fn place_order(
+        &mut self,
+        account_id: AccountId,
+        req: &OrderRequest,
+    ) -> Result<MatchResponse, RejectReason> {
         // Market buy orders not supported currently, need to implement quote price for it
         if req.order_type == OrderType::Market && req.side == Side::Bid {
             return Err(RejectReason::UnsupportedOrderType);
@@ -292,17 +301,17 @@ impl Engine {
             Side::Bid => {
                 // reserve USD
                 self.ledger
-                    .reserve(req.account_id, Currency::USD, req.price * req.size)?; // overflow
+                    .reserve(account_id, Currency::USD, req.price * req.size)?; // overflow
             }
             Side::Ask => {
                 // reserve base
                 self.ledger
-                    .reserve(req.account_id, req.base_currency, req.size)?;
+                    .reserve(account_id, req.base_currency, req.size)?;
             }
         }
 
         // match orders
-        let match_result = self.book.add_order(req);
+        let match_result = self.book.add_order(account_id, req);
 
         //settle trades
         for trade in match_result.trades.iter() {
@@ -317,15 +326,14 @@ impl Engine {
                 .map(|t| (req.price - t.price) * t.qty)
                 .sum();
             if surplus > 0 {
-                self.ledger
-                    .release(req.account_id, Currency::USD, surplus)?;
+                self.ledger.release(account_id, Currency::USD, surplus)?;
             }
         }
 
         Ok(match_result)
     }
-    fn cancel_order(&mut self, req: &CancelRequest) -> bool {
-        let Some(order) = self.book.cancel_order(req.order_id) else {
+    fn cancel_order(&mut self, account_id: AccountId, req: &CancelRequest) -> bool {
+        let Some(order) = self.book.cancel_order(account_id, req.order_id) else {
             return false;
         };
         let (currency, amount) = match order.side {
@@ -337,11 +345,24 @@ impl Engine {
     }
 }
 
-pub fn apply(engine: &mut Engine, command: Command) -> (CommandResponse, Vec<Event>) {
+pub fn apply(
+    engine: &mut Engine,
+    account_id: AccountId,
+    client_order_id: u64,
+    command: Command,
+) -> (CommandResponse, Vec<Event>) {
+    // Idempotency: `insert` returns false if the key was already present, i.e.
+    // this is a lost-ack retry. Bail before touching any state or emitting
+    // anything. This MUST live in `apply` (not `run_engine`) so silent replay
+    // rebuilds the set and reproduces the same accept/reject decisions.
+    if !engine.dedup.insert((account_id, client_order_id)) {
+        return (CommandResponse::Duplicate, vec![]);
+    }
+
     let mut events = vec![];
     let command_response = match command {
         Command::Place(order_request) => {
-            let place_order_res = engine.place_order(&order_request);
+            let place_order_res = engine.place_order(account_id, &order_request);
             if let Ok(match_response) = place_order_res {
                 let response = PlaceOrderResponse {
                     order_id: match_response.order_id,
@@ -354,7 +375,7 @@ pub fn apply(engine: &mut Engine, command: Command) -> (CommandResponse, Vec<Eve
                     .for_each(|t| events.push(Event::Trade(*t)));
                 events.push(Event::OrderAccepted {
                     order_id: match_response.order_id,
-                    account_id: order_request.account_id,
+                    account_id: account_id,
                     side: order_request.side,
                     order_type: order_request.order_type,
                     price: order_request.price,
@@ -367,7 +388,7 @@ pub fn apply(engine: &mut Engine, command: Command) -> (CommandResponse, Vec<Eve
             }
         }
         Command::Cancel(cancel_request) => {
-            let success = engine.cancel_order(&cancel_request);
+            let success = engine.cancel_order(account_id, &cancel_request);
             if success {
                 events.push(Event::OrderCancelled {
                     order_id: cancel_request.order_id,
@@ -376,17 +397,14 @@ pub fn apply(engine: &mut Engine, command: Command) -> (CommandResponse, Vec<Eve
             CommandResponse::Cancel(success)
         }
         Command::Deposit(deposit_request) => {
-            let available_balance = engine.ledger.deposit(
-                deposit_request.currency,
-                deposit_request.account_id,
-                deposit_request.amount,
-            );
+            let available_balance =
+                engine
+                    .ledger
+                    .deposit(deposit_request.currency, account_id, deposit_request.amount);
             CommandResponse::Deposit(available_balance)
         }
         Command::Withdraw(withdraw_request) => {
-            let res = engine
-                .ledger
-                .withdraw(withdraw_request.account_id, withdraw_request.amount);
+            let res = engine.ledger.withdraw(account_id, withdraw_request.amount);
             CommandResponse::Withdraw(res)
         }
     };
@@ -418,14 +436,20 @@ pub async fn recover(
 
         // deserialize data into CommandEnvelope (correlation_id is irrelevant
         // during replay — we emit nothing, so there's no one to reply to)
-        let Ok(CommandEnvelope { command, .. }) = serde_json::from_str(&data).inspect_err(|err| {
+        let Ok(CommandEnvelope {
+            command,
+            account_id,
+            client_order_id,
+            ..
+        }) = serde_json::from_str(&data).inspect_err(|err| {
             println!("Could not deserialize CommandEnvelope; Err:\n{}", err);
-        }) else {
+        })
+        else {
             continue;
         };
 
         // dispatch command and discard response
-        let _ = apply(engine, command);
+        let _ = apply(engine, account_id, client_order_id, command);
         last_id = Some(id);
     }
     println!("Recovery complete");
@@ -474,6 +498,8 @@ pub async fn run_engine(
                 // deserialize to CommandEnvelope
                 let Ok(CommandEnvelope {
                     correlation_id,
+                    account_id,
+                    client_order_id,
                     command,
                 }) = serde_json::from_str(&data).inspect_err(|err| {
                     println!("Could not deserialize CommandEnvelope; Err:\n{}", err);
@@ -485,8 +511,8 @@ pub async fn run_engine(
                     continue;
                 };
 
-                // dispatch command
-                let (resp, events) = apply(&mut engine, command);
+                // dispatch command (dedup happens inside `apply`)
+                let (response, events) = apply(&mut engine, account_id, client_order_id, command);
 
                 // emit events
                 for event in events {
@@ -501,7 +527,12 @@ pub async fn run_engine(
                 }
 
                 // serialize resp
-                let Ok(resp_json) = serde_json::to_string(&resp).inspect_err(|err| {
+                let resp_envelope = ResponseEnvelope {
+                    correlation_id,
+                    response,
+                };
+
+                let Ok(resp_json) = serde_json::to_string(&resp_envelope).inspect_err(|err| {
                     println!("Could not serialize Response; Err:\n{}", err);
                 }) else {
                     let _: i64 = pub_conn
@@ -511,7 +542,7 @@ pub async fn run_engine(
                 };
 
                 // publish response
-                let channel = format!("result:{}", correlation_id);
+                let channel = format!("results");
                 let _: Result<i64, redis::RedisError> = pub_conn
                     .publish(channel, &resp_json)
                     .await
@@ -565,6 +596,7 @@ mod test_util {
                 balances: HashMap::new(),
                 dirty: HashSet::new(),
             },
+            dedup: HashSet::new(),
         }
     }
 
@@ -581,14 +613,13 @@ mod test_util {
         // Book-only matching tests don't touch the ledger, so a fixed account
         // and base currency are fine here — they're just carried into trades.
         let order_request = OrderRequest {
-            account_id: 1,
             base_currency: Currency::SOL,
             order_type,
             side,
             price,
             size,
         };
-        book.add_order(&order_request)
+        book.add_order(1, &order_request)
     }
 
     /// Convenience wrapper over `place_full` returning just
@@ -767,7 +798,7 @@ mod cancel_tests {
         let (bid_id, _) = place(&mut book, OrderType::Limit, Side::Bid, 100, 10);
         assert_eq!(book.bids.get(&100).unwrap().len(), 1);
 
-        assert!(book.cancel_order(bid_id).is_some());
+        assert!(book.cancel_order(1, bid_id).is_some());
 
         // Empty price level must be removed after cancellation.
         assert!(
@@ -789,7 +820,7 @@ mod cancel_tests {
 
         assert_eq!(book.asks.get(&200).unwrap().len(), 3);
 
-        assert!(book.cancel_order(id2).is_some());
+        assert!(book.cancel_order(1, id2).is_some());
 
         let queue = book.asks.get(&200).unwrap();
         assert_eq!(queue.len(), 2);
@@ -808,7 +839,7 @@ mod cancel_tests {
         place(&mut book, OrderType::Limit, Side::Ask, 150, 10);
 
         // An id the engine could never have assigned (ids start at 0 and climb).
-        assert!(book.cancel_order(u64::MAX).is_none());
+        assert!(book.cancel_order(1, u64::MAX).is_none());
 
         assert_eq!(book.asks.get(&150).unwrap().len(), 1);
         assert_eq!(book.asks.get(&150).unwrap()[0].size, 10);
@@ -827,9 +858,28 @@ mod cancel_tests {
         assert_eq!(book.asks.get(&100).unwrap()[0].remaining_size, 15);
 
         // Cancel the remainder.
-        assert!(book.cancel_order(ask_id).is_some());
+        assert!(book.cancel_order(1, ask_id).is_some());
 
         assert!(book.asks.is_empty());
+        assert!(book.bids.is_empty());
+    }
+
+    // --- TEST 5: Cancel by a Non-Owner is Rejected ---
+    // Authorization: only the account that placed an order may cancel it. A
+    // stranger's cancel must be a no-op that leaves the order resting.
+    #[test]
+    fn test_cancel_by_non_owner_is_rejected() {
+        let mut book = new_book();
+
+        // `place` always places as account 1 (see `place_full`).
+        let (bid_id, _) = place(&mut book, OrderType::Limit, Side::Bid, 100, 10);
+
+        // Account 2 attempts to cancel account 1's order — rejected, untouched.
+        assert!(book.cancel_order(2, bid_id).is_none());
+        assert_eq!(book.bids.get(&100).unwrap().len(), 1);
+
+        // The rejection didn't corrupt state: the real owner can still cancel.
+        assert!(book.cancel_order(1, bid_id).is_some());
         assert!(book.bids.is_empty());
     }
 }
@@ -958,14 +1008,16 @@ mod ledger_tests {
         price: u64,
         size: u64,
     ) -> Result<MatchResponse, RejectReason> {
-        engine.place_order(&OrderRequest {
+        engine.place_order(
             account_id,
-            base_currency: Currency::SOL,
-            order_type,
-            side,
-            price,
-            size,
-        })
+            &OrderRequest {
+                base_currency: Currency::SOL,
+                order_type,
+                side,
+                price,
+                size,
+            },
+        )
     }
 
     // A buy with no funds is rejected before anything is reserved or matched.
@@ -1031,10 +1083,13 @@ mod ledger_tests {
         let res = submit(&mut engine, 1, Side::Bid, OrderType::Limit, 100, 10).unwrap();
         assert_eq!(bal(&engine, 1, Currency::USD), (0, 1000)); // fully held
 
-        let ok = engine.cancel_order(&CancelRequest {
-            order_id: res.order_id,
-            base_currency: Currency::SOL,
-        });
+        let ok = engine.cancel_order(
+            1,
+            &CancelRequest {
+                order_id: res.order_id,
+                base_currency: Currency::SOL,
+            },
+        );
         assert!(ok);
         assert_eq!(bal(&engine, 1, Currency::USD), (1000, 0)); // hold released
     }
