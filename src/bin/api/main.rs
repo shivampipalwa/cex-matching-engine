@@ -1,3 +1,5 @@
+mod auth;
+
 use axum::{
     Json, Router,
     extract::State,
@@ -6,6 +8,7 @@ use axum::{
     routing::post,
 };
 use futures_util::StreamExt;
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use matching_engine::types::{
     Command::{self},
     CommandEnvelope,
@@ -14,6 +17,7 @@ use matching_engine::types::{
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 use serde::Deserialize;
+use sqlx::PgPool;
 use std::{
     collections::HashMap,
     error::Error,
@@ -23,33 +27,36 @@ use std::{
 use tokio::{sync::oneshot, time::timeout};
 use uuid::Uuid;
 
-/// How long a handler waits for the engine's correlated reply before giving up.
+use crate::auth::AuthUser;
+
+/// How long a handler waits for the engine's reply before giving up.
 /// On timeout we return 504 — the command may still be durably logged and
-/// execute later, which is exactly why the client sends a `client_order_id`
-/// (its retry is deduped by the engine).
+/// to mitigate duplicate requests we use 'client_order_id'
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Correlation-id → the one-shot waiting handler. The shared subscriber removes
-/// an entry and fires its sender when the matching reply lands on `results`.
-/// A std `Mutex` is correct here: every critical section is a single map op and
-/// we never hold the guard across an `.await`.
+/// Correlation-id → one-shot waiting handler. The shared subscriber removes
+/// an entry and fires its sender when the matching replies with the `results`.
+/// std `Mutex`: every critical section is a single map op and we never hold
+/// the guard across an `.await`.
 type Pending = Arc<Mutex<HashMap<Uuid, oneshot::Sender<ResponseEnvelope>>>>;
+
+struct Keys {
+    encoding_key: EncodingKey,
+    decoding_key: DecodingKey,
+}
 
 #[derive(Clone)]
 struct AppState {
     /// Cheap to clone and share; used by handlers to `XADD` commands.
     xadd_conn: MultiplexedConnection,
     pending: Pending,
+    pg_pool: PgPool,
+    keys: Arc<Keys>,
 }
 
-/// Request body for `POST /orders`. Carries *intent* plus the client-supplied
-/// idempotency key.
-///
-/// NOTE: `account_id` is here only until M6.2 — once JWT auth lands, identity is
-/// stamped from the verified token and this field comes off the body.
+/// Request body for `POST /orders`. Carries intent and the client-supplied idempotency key.
 #[derive(Deserialize)]
 struct PlaceOrderBody {
-    account_id: u64,
     client_order_id: u64,
     base_currency: Currency,
     order_type: OrderType,
@@ -60,12 +67,12 @@ struct PlaceOrderBody {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    dotenvy::dotenv().ok();
+
     let client = Client::open("redis://127.0.0.1:6379/")?;
     let xadd_conn = client.get_multiplexed_async_connection().await?;
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
-    // Start the shared result subscriber BEFORE we serve, so no reply can be
-    // missed for a request accepted the instant the server comes up.
     {
         let client = client.clone();
         let pending = pending.clone();
@@ -75,9 +82,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         });
     }
-
-    let state = AppState { xadd_conn, pending };
+    let pg_pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    let keys = Keys {
+        encoding_key: EncodingKey::from_secret(&std::env::var("JWT_SECRET")?.as_bytes()),
+        decoding_key: DecodingKey::from_secret(&std::env::var("JWT_SECRET")?.as_bytes()),
+    };
+    let state = AppState {
+        xadd_conn,
+        pending,
+        pg_pool,
+        keys: Arc::new(keys),
+    };
     let app = Router::new()
+        .route("/auth/signup", post(auth::signup))
+        .route("/auth/login", post(auth::login))
         .route("/orders", post(place_order))
         .with_state(state);
 
@@ -87,9 +105,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// One task, one pub/sub connection, for every in-flight request. It plainly
-/// `SUBSCRIBE`s the single `results` channel, reads the `correlation_id` from
-/// the message body (not the channel name), and hands the reply to the waiter.
+/// for every request- one task, one pub/sub connection.
+/// `SUBSCRIBE`s to `results` channel, reads the `correlation_id` from
+/// the message body, and sends the reply back to the waiter via sender.
 async fn run_result_subscriber(client: Client, pending: Pending) -> Result<(), redis::RedisError> {
     let mut pubsub = client.get_async_pubsub().await?;
     pubsub.subscribe("results").await?;
@@ -113,41 +131,13 @@ async fn run_result_subscriber(client: Client, pending: Pending) -> Result<(), r
     Ok(())
 }
 
-/// `POST /orders` — turn the request into a command, ride the correlation flow,
-/// and map the engine's reply to an HTTP status.
-///
-/// ---- IMPLEMENT ME (M6.1) ----
-/// You'll want these extra imports:
-///   matching_engine::types::{Command, CommandEnvelope, OrderRequest, CommandResponse}
-///   redis::AsyncCommands            // for `.xadd`
-///   tokio::time::timeout
-///
-/// Steps:
-///   1. Build the intent-only command:
-///        Command::Place(OrderRequest { base_currency, order_type, side, price, size })
-///   2. Mint `let correlation_id = Uuid::new_v4();` and
-///        `let (tx, rx) = oneshot::channel();`
-///   3. REGISTER before you publish — insert `tx` into `state.pending` under
-///      `correlation_id` NOW. (Register-before-XADD: the engine can publish the
-///      reply before you'd otherwise be listening.)
-///   4. `XADD commands` a serialized CommandEnvelope { correlation_id,
-///      account_id: body.account_id, client_order_id: body.client_order_id,
-///      command }. Clone `state.xadd_conn` for a `&mut`.
-///   5. `match timeout(REQUEST_TIMEOUT, rx).await` — on `Err(_)` (timed out) or
-///      `Ok(Err(_))` (sender dropped), REMOVE your entry from `state.pending`
-///      (or it leaks) and return `StatusCode::GATEWAY_TIMEOUT`.
-///   6. Map `envelope.response` (a `CommandResponse`) to a response:
-///        Place(Ok(r))   -> (StatusCode::OK, Json(r))
-///        Place(Err(e))  -> (StatusCode::BAD_REQUEST, Json(e))
-///        Duplicate      -> StatusCode::CONFLICT
-///        _              -> StatusCode::INTERNAL_SERVER_ERROR  // unreachable here
+/// `POST /orders`
 async fn place_order(
     State(mut state): State<AppState>,
+    AuthUser(account_id): AuthUser,
     Json(body): Json<PlaceOrderBody>,
 ) -> impl IntoResponse {
-    // let _ = (&state, &body); // silence unused until the flow is wired
     let PlaceOrderBody {
-        account_id,
         client_order_id,
         base_currency,
         order_type,

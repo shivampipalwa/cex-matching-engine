@@ -14,5 +14,7 @@ futures-util = "0.3.32"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "bigdecimal", "macros"] }
 bigdecimal = "0.4"
 dotenvy = "0.15.7"
-jsonwebtoken = "10.4.0"
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 argon2 = "0.5.3"
+thiserror = "2.0.19"
+async-trait = "0.1.91"
