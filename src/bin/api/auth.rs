@@ -144,6 +144,12 @@ pub(crate) enum ApiError {
     EmailTaken,
     #[error("bad request: {0}")]
     BadRequest(&'static str),
+    #[error("not found")]
+    NotFound,
+    // Command is durably logged and may still execute; the client's
+    // X-Client-Order-Id makes a retry safe.
+    #[error("engine did not respond in time")]
+    Timeout,
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -154,6 +160,8 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::EmailTaken => StatusCode::CONFLICT,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::NotFound => StatusCode::NOT_FOUND,
+            ApiError::Timeout => StatusCode::GATEWAY_TIMEOUT,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
         .into_response()

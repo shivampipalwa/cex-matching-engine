@@ -2,21 +2,25 @@ mod auth;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{delete, get, post},
 };
+use bigdecimal::BigDecimal;
 use futures_util::StreamExt;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use matching_engine::types::{
+    AccountId, CancelRequest,
     Command::{self},
     CommandEnvelope,
     CommandResponse::{self},
-    OrderRequest, OrderType, Pair, ResponseEnvelope, Side,
+    Currency, DepositRequest, OrderRequest, OrderType, Pair, ResponseEnvelope, Side,
+    WithdrawRequest,
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::PgPool;
 use std::{
     collections::HashMap,
@@ -27,7 +31,7 @@ use std::{
 use tokio::{sync::oneshot, time::timeout};
 use uuid::Uuid;
 
-use crate::auth::{AuthUser, ClientOrderId};
+use crate::auth::{ApiError, AuthUser, ClientOrderId};
 
 /// How long a handler waits for the engine's reply before giving up.
 /// On timeout we return 504 — the command may still be durably logged and
@@ -64,6 +68,37 @@ struct PlaceOrderBody {
     size: u64,
 }
 
+#[derive(Deserialize)]
+struct DepositBody {
+    amount: u64,
+    currency: Currency,
+}
+
+#[derive(Deserialize)]
+struct WithdrawBody {
+    amount: u64,
+}
+
+// Projection rows. Amounts are NUMERIC in Postgres; BigDecimal keeps them exact.
+#[derive(Serialize, sqlx::FromRow)]
+struct BalanceRow {
+    currency: String,
+    available: BigDecimal,
+    reserved: BigDecimal,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct OrderRow {
+    order_id: BigDecimal,
+    pair: String,
+    side: String,
+    order_type: String,
+    price: BigDecimal,
+    size: BigDecimal,
+    filled_qty: BigDecimal,
+    status: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
@@ -95,7 +130,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let app = Router::new()
         .route("/auth/signup", post(auth::signup))
         .route("/auth/login", post(auth::login))
-        .route("/orders", post(place_order))
+        .route("/orders", post(place_order).get(get_orders))
+        // axum 0.7 path-param syntax is `:id` ({id} is 0.8+).
+        .route("/orders/:id", delete(cancel_order))
+        .route("/deposits", post(deposit))
+        .route("/withdrawals", post(withdraw))
+        .route("/balances", get(get_balances))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
@@ -130,13 +170,79 @@ async fn run_result_subscriber(client: Client, pending: Pending) -> Result<(), r
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Writes: every one rides the same correlation flow, so it lives in one place.
+// ---------------------------------------------------------------------------
+
+/// Log a command and wait for the engine's correlated reply.
+///
+/// Ordering matters: register the waiter BEFORE the XADD, or the engine can
+/// publish the reply before we're listening. Every early exit must drop the
+/// pending entry, else the map leaks.
+async fn submit_command(
+    state: &mut AppState,
+    account_id: AccountId,
+    client_order_id: u64,
+    command: Command,
+) -> Result<CommandResponse, ApiError> {
+    let correlation_id = Uuid::new_v4();
+
+    // Serialize before registering so a failure here can't orphan a waiter.
+    let json_envelope = serde_json::to_string(&CommandEnvelope {
+        correlation_id,
+        account_id,
+        client_order_id,
+        command,
+    })
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let (tx, rx) = oneshot::channel::<ResponseEnvelope>();
+    state.pending.lock().unwrap().insert(correlation_id, tx);
+
+    let xadd: Result<String, redis::RedisError> = state
+        .xadd_conn
+        .xadd("commands", "*", &[("data", json_envelope)])
+        .await;
+    if let Err(e) = xadd {
+        state.pending.lock().unwrap().remove(&correlation_id);
+        return Err(ApiError::Internal(e.to_string()));
+    }
+
+    match timeout(REQUEST_TIMEOUT, rx).await {
+        Ok(Ok(reply)) => Ok(reply.response),
+        // timed out, or the subscriber dropped our sender
+        _ => {
+            state.pending.lock().unwrap().remove(&correlation_id);
+            Err(ApiError::Timeout)
+        }
+    }
+}
+
+/// The one place engine responses become HTTP responses.
+fn response_for(resp: CommandResponse) -> Response {
+    match resp {
+        CommandResponse::Place(Ok(r)) => (StatusCode::OK, Json(r)).into_response(),
+        CommandResponse::Place(Err(e)) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
+        // false = unknown order OR not the caller's. Same 404 either way, so we
+        // don't leak the existence of other accounts' orders.
+        CommandResponse::Cancel(true) => StatusCode::NO_CONTENT.into_response(),
+        CommandResponse::Cancel(false) => ApiError::NotFound.into_response(),
+        CommandResponse::Deposit(available) => {
+            (StatusCode::OK, Json(json!({ "available": available }))).into_response()
+        }
+        CommandResponse::Withdraw(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        CommandResponse::Withdraw(Err(e)) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
+        CommandResponse::Duplicate => StatusCode::CONFLICT.into_response(),
+    }
+}
+
 /// `POST /orders`
 async fn place_order(
     State(mut state): State<AppState>,
     AuthUser(account_id): AuthUser,
     ClientOrderId(client_order_id): ClientOrderId,
     Json(body): Json<PlaceOrderBody>,
-) -> impl IntoResponse {
+) -> Response {
     let PlaceOrderBody {
         pair,
         order_type,
@@ -151,48 +257,92 @@ async fn place_order(
         price,
         size,
     });
-    let correlation_id = Uuid::new_v4();
-    let (tx, rx) = oneshot::channel::<ResponseEnvelope>();
-    let Ok(json_envelope) = serde_json::to_string(&CommandEnvelope {
-        correlation_id,
-        account_id,
-        client_order_id,
-        command,
-    }) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR).into_response();
-    };
-
-    // Drop mutex so the lock is not held across await
-    {
-        let mut map = state.pending.lock().unwrap();
-        map.insert(correlation_id, tx);
+    match submit_command(&mut state, account_id, client_order_id, command).await {
+        Ok(resp) => response_for(resp),
+        Err(e) => e.into_response(),
     }
-
-    let Ok(_): Result<String, redis::RedisError> = state
-        .xadd_conn
-        .xadd("commands", "*", &[("data", json_envelope)])
-        .await
-    else {
-        state.pending.lock().unwrap().remove(&correlation_id);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-
-    match timeout(REQUEST_TIMEOUT, rx).await {
-        Ok(Ok(reply)) => response_for(reply.response),
-        _ => {
-            state.pending.lock().unwrap().remove(&correlation_id);
-            StatusCode::GATEWAY_TIMEOUT.into_response()
-        }
-    }
-
-    // StatusCode::NOT_IMPLEMENTED
 }
 
-fn response_for(resp: CommandResponse) -> Response {
-    match resp {
-        CommandResponse::Place(Ok(r)) => (StatusCode::OK, Json(r)).into_response(),
-        CommandResponse::Place(Err(e)) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
-        CommandResponse::Duplicate => StatusCode::CONFLICT.into_response(),
-        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+/// `DELETE /orders/:id` — the engine resolves the market and checks ownership.
+async fn cancel_order(
+    State(mut state): State<AppState>,
+    AuthUser(account_id): AuthUser,
+    ClientOrderId(client_order_id): ClientOrderId,
+    Path(order_id): Path<u64>,
+) -> Response {
+    let command = Command::Cancel(CancelRequest { order_id });
+    match submit_command(&mut state, account_id, client_order_id, command).await {
+        Ok(resp) => response_for(resp),
+        Err(e) => e.into_response(),
     }
+}
+
+/// `POST /deposits` — a dev affordance. A real exchange credits deposits from an
+/// observed chain/bank event, never a client call.
+async fn deposit(
+    State(mut state): State<AppState>,
+    AuthUser(account_id): AuthUser,
+    ClientOrderId(client_order_id): ClientOrderId,
+    Json(body): Json<DepositBody>,
+) -> Response {
+    let command = Command::Deposit(DepositRequest {
+        amount: body.amount,
+        currency: body.currency,
+    });
+    match submit_command(&mut state, account_id, client_order_id, command).await {
+        Ok(resp) => response_for(resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /withdrawals` — USD only for now (the ledger's withdraw is hardcoded).
+async fn withdraw(
+    State(mut state): State<AppState>,
+    AuthUser(account_id): AuthUser,
+    ClientOrderId(client_order_id): ClientOrderId,
+    Json(body): Json<WithdrawBody>,
+) -> Response {
+    let command = Command::Withdraw(WithdrawRequest {
+        amount: body.amount,
+    });
+    match submit_command(&mut state, account_id, client_order_id, command).await {
+        Ok(resp) => response_for(resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reads: straight off the DB projection, never through the command log — reads
+// need no ordering or durability, and would serialize behind the engine thread.
+// Always scoped by the token's account_id, never a client-supplied one.
+// ---------------------------------------------------------------------------
+
+/// `GET /balances`
+async fn get_balances(
+    State(state): State<AppState>,
+    AuthUser(account_id): AuthUser,
+) -> Result<Json<Vec<BalanceRow>>, ApiError> {
+    let rows = sqlx::query_as::<_, BalanceRow>(
+        "SELECT currency, available, reserved FROM balances
+          WHERE account_id = $1 ORDER BY currency",
+    )
+    .bind(account_id as i64)
+    .fetch_all(&state.pg_pool)
+    .await?;
+    Ok(Json(rows))
+}
+
+/// `GET /orders`
+async fn get_orders(
+    State(state): State<AppState>,
+    AuthUser(account_id): AuthUser,
+) -> Result<Json<Vec<OrderRow>>, ApiError> {
+    let rows = sqlx::query_as::<_, OrderRow>(
+        "SELECT order_id, pair, side, order_type, price, size, filled_qty, status
+           FROM orders WHERE account_id = $1 ORDER BY order_id DESC",
+    )
+    .bind(account_id as i64)
+    .fetch_all(&state.pg_pool)
+    .await?;
+    Ok(Json(rows))
 }

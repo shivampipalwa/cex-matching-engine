@@ -99,7 +99,47 @@ assert_eq "order without X-Client-Order-Id rejected" "$code" "400"
 code=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":100,"size":10}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 2" | tail -1)
 assert_eq "duplicate client_order_id rejected" "$code" "409"
 
-echo "== 8. verify projection =="
+echo "== 8. deposits / withdrawals =="
+code=$(post "$API/deposits" '{"amount":50,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 10" | tail -1)
+assert_eq "deposit accepted" "$code" "200"
+code=$(post "$API/withdrawals" '{"amount":20}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 11" | tail -1)
+assert_eq "withdrawal accepted" "$code" "204"
+# more than available -> engine rejects
+code=$(post "$API/withdrawals" '{"amount":999999}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 12" | tail -1)
+assert_eq "overdraft withdrawal rejected" "$code" "400"
+
+echo "== 9. cancel (ownership enforced by the engine) =="
+# buyer rests a bid that won't cross
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":1,"size":5}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 20")
+OID=$(echo "$resp" | head -1 | jq -r .order_id)
+assert_eq "resting bid accepted" "$(echo "$resp" | tail -1)" "200"
+# the seller must NOT be able to cancel the buyer's order
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/orders/$OID" \
+  -H "Authorization: Bearer $TOK2" -H 'X-Client-Order-Id: 21')
+assert_eq "non-owner cancel rejected" "$code" "404"
+# the owner can
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/orders/$OID" \
+  -H "Authorization: Bearer $TOK1" -H 'X-Client-Order-Id: 22')
+assert_eq "owner cancel succeeds" "$code" "204"
+# unknown order
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/orders/999999" \
+  -H "Authorization: Bearer $TOK1" -H 'X-Client-Order-Id: 23')
+assert_eq "cancel of unknown order 404s" "$code" "404"
+
+echo "== 10. reads (account-scoped, off the projection) =="
+sleep 0.5
+bal1=$(curl -s "$API/balances" -H "Authorization: Bearer $TOK1")
+assert_eq "buyer sees own SOL balance" "$(echo "$bal1" | jq -r '.[] | select(.currency=="SOL") | .available')" "10"
+ord1=$(curl -s "$API/orders" -H "Authorization: Bearer $TOK1")
+# buyer placed: the filled bid + the cancelled bid
+assert_eq "buyer sees only own orders" "$(echo "$ord1" | jq 'length')" "2"
+assert_eq "cancelled order reflected" "$(echo "$ord1" | jq -r '[.[] | select(.status=="cancelled")] | length')" "1"
+ord2=$(curl -s "$API/orders" -H "Authorization: Bearer $TOK2")
+assert_eq "seller sees only own orders" "$(echo "$ord2" | jq 'length')" "1"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$API/balances")
+assert_eq "reads require auth" "$code" "401"
+
+echo "== 11. verify projection =="
 sleep 0.5
 assert_eq "one trade recorded"  "$(psql 'select count(*) from trades')" "1"
 assert_eq "trade price"         "$(psql 'select price from trades')"    "100"
@@ -109,7 +149,7 @@ assert_eq "trade tagged with pair" "$(psql 'select pair from trades')" "SOL-USD"
 # fill tracking: both sides fully filled, cumulative qty recorded
 assert_eq "both orders filled"   "$(psql "select count(*) from orders where status='filled'")" "2"
 assert_eq "no orders left open"  "$(psql "select count(*) from orders where status='open'")"   "0"
-assert_eq "filled_qty recorded"  "$(psql 'select distinct filled_qty from orders')" "10"
+assert_eq "filled_qty recorded"  "$(psql "select distinct filled_qty from orders where status='filled'")" "10"
 
 echo
 echo "ALL CHECKS PASSED"
