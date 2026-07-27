@@ -55,6 +55,25 @@ pub(crate) struct AuthResponse {
 
 pub(crate) struct AuthUser(pub AccountId);
 
+/// The client-supplied idempotency key, from `X-Client-Order-Id` header.
+pub(crate) struct ClientOrderId(pub u64);
+
+#[async_trait]
+impl<S: Send + Sync> FromRequestParts<S> for ClientOrderId {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, ApiError> {
+        parts
+            .headers
+            .get("x-client-order-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(ClientOrderId)
+            .ok_or(ApiError::BadRequest(
+                "missing or invalid X-Client-Order-Id header",
+            ))
+    }
+}
+
 #[async_trait]
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = ApiError;
@@ -123,6 +142,8 @@ pub(crate) enum ApiError {
     Unauthorized,
     #[error("email already registered")]
     EmailTaken,
+    #[error("bad request: {0}")]
+    BadRequest(&'static str),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -132,6 +153,7 @@ impl IntoResponse for ApiError {
         match self {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::EmailTaken => StatusCode::CONFLICT,
+            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
         .into_response()

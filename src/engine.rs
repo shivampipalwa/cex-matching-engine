@@ -1,7 +1,7 @@
 use crate::types::{
     AccountId, Balance, CancelRequest, Command, CommandEnvelope, CommandResponse, Currency, Engine,
-    Event, Ledger, MatchResponse, Order, OrderBook, OrderLocation, OrderRequest, OrderType,
-    PlaceOrderResponse, RejectReason, ResponseEnvelope, Side, Trade,
+    Event, Ledger, MatchResponse, Order, OrderBook, OrderLocation, OrderRequest, OrderStatus,
+    OrderType, OrderUpdate, Pair, PlaceOrderResponse, RejectReason, ResponseEnvelope, Side, Trade,
 };
 use redis::{AsyncCommands, aio::MultiplexedConnection, streams::StreamRangeReply};
 use std::{cmp::min, collections::VecDeque, error::Error};
@@ -10,9 +10,15 @@ use redis::streams::{StreamReadOptions, StreamReadReply};
 
 impl OrderBook {
     // returns filled quantity
-    fn add_order(&mut self, account_id: AccountId, order_request: &OrderRequest) -> MatchResponse {
+    // `order_id` is assigned by the engine (global counter), not the book.
+    fn add_order(
+        &mut self,
+        order_id: u64,
+        account_id: AccountId,
+        order_request: &OrderRequest,
+    ) -> MatchResponse {
         let mut order = Order {
-            id: self.next_order_id,
+            id: order_id,
             account_id: account_id,
             order_type: order_request.order_type,
             side: order_request.side,
@@ -22,8 +28,8 @@ impl OrderBook {
         };
 
         let mut trades = vec![];
+        let mut updates: Vec<OrderUpdate> = vec![];
 
-        self.next_order_id += 1;
         while order.remaining_size > 0 {
             // get the queue for bid/ask orders with best price
 
@@ -61,6 +67,7 @@ impl OrderBook {
                         best_price_order.remaining_size = 0;
                     }
                     let trade = Trade {
+                        pair: order_request.pair,
                         price: best_price_order.price,
                         qty: trade_qty,
                         maker_id: best_price_order.id,
@@ -70,6 +77,21 @@ impl OrderBook {
                         taker_account: order.account_id,
                     };
                     trades.push(trade);
+
+                    // Capture the maker's post-fill state now — a filled maker is
+                    // about to be dropped from the book.
+                    updates.push(OrderUpdate {
+                        order_id: best_price_order.id,
+                        account_id: best_price_order.account_id,
+                        filled_qty: best_price_order.size - best_price_order.remaining_size,
+                        remaining_size: best_price_order.remaining_size,
+                        status: if best_price_order.remaining_size == 0 {
+                            OrderStatus::Filled
+                        } else {
+                            OrderStatus::PartiallyFilled
+                        },
+                    });
+
                     // remove order from queue if it is filled
                     if best_price_order.remaining_size == 0 {
                         self.order_index.remove(&best_price_order.id);
@@ -121,9 +143,34 @@ impl OrderBook {
                 );
             }
         }
+        // Taker's own state. A market order's unfilled remainder never rests, so
+        // it's terminal -> Cancelled. No update when a limit order simply rests
+        // untouched: OrderAccepted already reported open/0.
+        let taker_filled = order.size - order.remaining_size;
+        let taker_status = if order.remaining_size == 0 {
+            Some(OrderStatus::Filled)
+        } else if order.order_type == OrderType::Market {
+            Some(OrderStatus::Cancelled)
+        } else if taker_filled > 0 {
+            Some(OrderStatus::PartiallyFilled)
+        } else {
+            None
+        };
+        if let Some(status) = taker_status {
+            updates.push(OrderUpdate {
+                order_id: order.id,
+                account_id: order.account_id,
+                filled_qty: taker_filled,
+                remaining_size: order.remaining_size,
+                status,
+            });
+        }
+
         MatchResponse {
             order_id: order.id,
             trades,
+            updates,
+            taker_remaining: order.remaining_size,
         }
     }
 
@@ -233,48 +280,49 @@ impl Ledger {
         Ok(())
     }
 
-    fn settle(&mut self, currency: Currency, trade: &Trade) {
+    fn settle(&mut self, pair: Pair, trade: &Trade) {
+        let (currency, quote) = (pair.base, pair.quote);
         match trade.taker_side {
             Side::Bid => {
                 // update taker's ledger
                 let takers_balance = self.balances.entry(trade.taker_account).or_default();
-                let takers_quote_balance = takers_balance.entry(Currency::USD).or_default();
+                let takers_quote_balance = takers_balance.entry(quote).or_default();
                 takers_quote_balance.reserved -= trade.price * trade.qty; //overflow
                 let takers_base_balance = takers_balance.entry(currency).or_default();
                 takers_base_balance.available += trade.qty;
 
                 //update maker's ledger
                 let makers_balance = self.balances.entry(trade.maker_account).or_default();
-                let makers_quote_balance = makers_balance.entry(Currency::USD).or_default();
+                let makers_quote_balance = makers_balance.entry(quote).or_default();
                 makers_quote_balance.available += trade.price * trade.qty; //overflow
                 let makers_base_balance = makers_balance.entry(currency).or_default();
                 makers_base_balance.reserved -= trade.qty;
 
                 // record dirty
-                self.dirty.insert((trade.taker_account, Currency::USD));
+                self.dirty.insert((trade.taker_account, quote));
                 self.dirty.insert((trade.taker_account, currency));
-                self.dirty.insert((trade.maker_account, Currency::USD));
+                self.dirty.insert((trade.maker_account, quote));
                 self.dirty.insert((trade.maker_account, currency));
             }
             Side::Ask => {
                 // update taker's ledger
                 let takers_balance = self.balances.entry(trade.taker_account).or_default();
-                let takers_quote_balance = takers_balance.entry(Currency::USD).or_default();
+                let takers_quote_balance = takers_balance.entry(quote).or_default();
                 takers_quote_balance.available += trade.price * trade.qty; //overflow
                 let takers_base_balance = takers_balance.entry(currency).or_default();
                 takers_base_balance.reserved -= trade.qty;
 
                 //update maker;s ledger
                 let makers_balance = self.balances.entry(trade.maker_account).or_default();
-                let makers_quote_balance = makers_balance.entry(Currency::USD).or_default();
+                let makers_quote_balance = makers_balance.entry(quote).or_default();
                 makers_quote_balance.reserved -= trade.price * trade.qty; //overflow
                 let makers_base_balance = makers_balance.entry(currency).or_default();
                 makers_base_balance.available += trade.qty;
 
                 // record dirty
-                self.dirty.insert((trade.taker_account, Currency::USD));
+                self.dirty.insert((trade.taker_account, quote));
                 self.dirty.insert((trade.taker_account, currency));
-                self.dirty.insert((trade.maker_account, Currency::USD));
+                self.dirty.insert((trade.maker_account, quote));
                 self.dirty.insert((trade.maker_account, currency));
             }
         }
@@ -291,6 +339,9 @@ impl Engine {
         account_id: AccountId,
         req: &OrderRequest,
     ) -> Result<MatchResponse, RejectReason> {
+        if !req.pair.is_valid() {
+            return Err(RejectReason::InvalidPair);
+        }
         // Market buy orders not supported currently, need to implement quote price for it
         if req.order_type == OrderType::Market && req.side == Side::Bid {
             return Err(RejectReason::UnsupportedOrderType);
@@ -299,23 +350,50 @@ impl Engine {
         // reserve funds
         match req.side {
             Side::Bid => {
-                // reserve USD
+                // reserve quote
                 self.ledger
-                    .reserve(account_id, Currency::USD, req.price * req.size)?; // overflow
+                    .reserve(account_id, req.pair.quote, req.price * req.size)?; // overflow
             }
             Side::Ask => {
                 // reserve base
-                self.ledger
-                    .reserve(account_id, req.base_currency, req.size)?;
+                self.ledger.reserve(account_id, req.pair.base, req.size)?;
             }
         }
 
-        // match orders
-        let match_result = self.book.add_order(account_id, req);
+        // match in this pair's book, creating it on first use
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+        let book = self.books.entry(req.pair).or_default();
+        let match_result = book.add_order(order_id, account_id, req);
+
+        // route future cancels; drop makers this trade fully filled
+        let rested = book.order_index.contains_key(&order_id);
+        let filled_makers: Vec<u64> = match_result
+            .trades
+            .iter()
+            .map(|t| t.maker_id)
+            .filter(|id| !book.order_index.contains_key(id))
+            .collect();
+        if rested {
+            self.order_pair.insert(order_id, req.pair);
+        }
+        for id in filled_makers {
+            self.order_pair.remove(&id);
+        }
 
         //settle trades
         for trade in match_result.trades.iter() {
-            self.ledger.settle(req.base_currency, trade);
+            self.ledger.settle(req.pair, trade);
+        }
+
+        // A market order's unfilled remainder never rests, so its reserve has no
+        // open commitment behind it — release it or it's stuck forever.
+        if req.order_type == OrderType::Market && match_result.taker_remaining > 0 {
+            let (currency, amount) = match req.side {
+                Side::Bid => (req.pair.quote, match_result.taker_remaining * req.price),
+                Side::Ask => (req.pair.base, match_result.taker_remaining),
+            };
+            let _ = self.ledger.release(account_id, currency, amount);
         }
 
         // buyer surplus form reserved -> available in case of price-improved fill
@@ -326,22 +404,28 @@ impl Engine {
                 .map(|t| (req.price - t.price) * t.qty)
                 .sum();
             if surplus > 0 {
-                self.ledger.release(account_id, Currency::USD, surplus)?;
+                self.ledger.release(account_id, req.pair.quote, surplus)?;
             }
         }
 
         Ok(match_result)
     }
-    fn cancel_order(&mut self, account_id: AccountId, req: &CancelRequest) -> bool {
-        let Some(order) = self.book.cancel_order(account_id, req.order_id) else {
-            return false;
-        };
+    // Returns the removed order (with its market) so callers can emit its final state.
+    fn cancel_order(
+        &mut self,
+        account_id: AccountId,
+        req: &CancelRequest,
+    ) -> Option<(Pair, Order)> {
+        let &pair = self.order_pair.get(&req.order_id)?;
+        let book = self.books.get_mut(&pair)?;
+        let order = book.cancel_order(account_id, req.order_id)?;
         let (currency, amount) = match order.side {
-            Side::Bid => (Currency::USD, order.remaining_size * order.price),
-            Side::Ask => (req.base_currency, order.remaining_size),
+            Side::Bid => (pair.quote, order.remaining_size * order.price),
+            Side::Ask => (pair.base, order.remaining_size),
         };
         let _ = self.ledger.release(order.account_id, currency, amount);
-        true
+        self.order_pair.remove(&req.order_id);
+        Some((pair, order))
     }
 }
 
@@ -353,8 +437,7 @@ pub fn apply(
 ) -> (CommandResponse, Vec<Event>) {
     // Idempotency: `insert` returns false if the key was already present, i.e.
     // this is a lost-ack retry. Bail before touching any state or emitting
-    // anything. This MUST live in `apply` (not `run_engine`) so silent replay
-    // rebuilds the set and reproduces the same accept/reject decisions.
+    // anything.
     if !engine.dedup.insert((account_id, client_order_id)) {
         return (CommandResponse::Duplicate, vec![]);
     }
@@ -369,18 +452,29 @@ pub fn apply(
                     filled_qty: match_response.trades.iter().map(|t| t.qty).sum(),
                     total_cost: match_response.trades.iter().map(|t| t.qty * t.price).sum(),
                 };
-                match_response
-                    .trades
-                    .iter()
-                    .for_each(|t| events.push(Event::Trade(*t)));
                 events.push(Event::OrderAccepted {
                     order_id: match_response.order_id,
                     account_id: account_id,
+                    pair: order_request.pair,
                     side: order_request.side,
                     order_type: order_request.order_type,
                     price: order_request.price,
                     size: order_request.size,
                 });
+                match_response
+                    .trades
+                    .iter()
+                    .for_each(|t| events.push(Event::Trade(*t)));
+                for u in match_response.updates.iter() {
+                    events.push(Event::OrderUpdated {
+                        order_id: u.order_id,
+                        account_id: u.account_id,
+                        pair: order_request.pair,
+                        filled_qty: u.filled_qty,
+                        remaining_qty: u.remaining_size,
+                        status: u.status,
+                    });
+                }
                 CommandResponse::Place(Ok(response))
             } else {
                 let e = place_order_res.unwrap_err();
@@ -388,13 +482,21 @@ pub fn apply(
             }
         }
         Command::Cancel(cancel_request) => {
-            let success = engine.cancel_order(account_id, &cancel_request);
-            if success {
+            let outcome = engine.cancel_order(account_id, &cancel_request);
+            if let Some((pair, order)) = outcome {
                 events.push(Event::OrderCancelled {
                     order_id: cancel_request.order_id,
                 });
+                events.push(Event::OrderUpdated {
+                    order_id: order.id,
+                    account_id: order.account_id,
+                    pair,
+                    filled_qty: order.size - order.remaining_size,
+                    remaining_qty: order.remaining_size,
+                    status: OrderStatus::Cancelled,
+                });
             }
-            CommandResponse::Cancel(success)
+            CommandResponse::Cancel(outcome.is_some())
         }
         Command::Deposit(deposit_request) => {
             let available_balance =
@@ -574,52 +676,68 @@ pub async fn run_engine(
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod test_util {
-    use std::collections::{BTreeMap, HashMap, HashSet};
-
     use super::*;
+    use std::ops::{Deref, DerefMut};
 
-    pub fn new_book() -> OrderBook {
-        OrderBook {
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
-            order_index: HashMap::new(),
-            next_order_id: 0,
+    pub const TEST_PAIR: Pair = Pair {
+        base: Currency::SOL,
+        quote: Currency::USD,
+    };
+
+    /// A book plus the id counter the engine normally owns, so book-only tests
+    /// can keep calling `place(...)`. Derefs to `OrderBook`.
+    pub struct TestBook {
+        pub book: OrderBook,
+        pub next_id: u64,
+    }
+
+    impl Deref for TestBook {
+        type Target = OrderBook;
+        fn deref(&self) -> &OrderBook {
+            &self.book
+        }
+    }
+    impl DerefMut for TestBook {
+        fn deref_mut(&mut self) -> &mut OrderBook {
+            &mut self.book
         }
     }
 
-    /// A fresh `Engine` (empty book + empty ledger) for the ledger/settlement
+    pub fn new_book() -> TestBook {
+        TestBook {
+            book: OrderBook::new(),
+            next_id: 0,
+        }
+    }
+
+    /// A fresh `Engine` (no books + empty ledger) for the ledger/settlement
     /// tests that need the full reserve → match → settle path.
     pub fn new_engine() -> Engine {
-        Engine {
-            book: new_book(),
-            ledger: Ledger {
-                balances: HashMap::new(),
-                dirty: HashSet::new(),
-            },
-            dedup: HashSet::new(),
-        }
+        Engine::new()
     }
 
     /// Places an order and returns the full `MatchResponse` (order id + trades).
     /// Use this when a test needs to assert on the emitted trades themselves —
     /// execution price, maker/taker ids, taker side.
     pub fn place_full(
-        book: &mut OrderBook,
+        book: &mut TestBook,
         order_type: OrderType,
         side: Side,
         price: u64,
         size: u64,
     ) -> MatchResponse {
         // Book-only matching tests don't touch the ledger, so a fixed account
-        // and base currency are fine here — they're just carried into trades.
+        // and pair are fine here — they're just carried into trades.
         let order_request = OrderRequest {
-            base_currency: Currency::SOL,
+            pair: TEST_PAIR,
             order_type,
             side,
             price,
             size,
         };
-        book.add_order(1, &order_request)
+        let id = book.next_id;
+        book.next_id += 1;
+        book.book.add_order(id, 1, &order_request)
     }
 
     /// Convenience wrapper over `place_full` returning just
@@ -630,7 +748,7 @@ mod test_util {
     ///   read it from here, never hardcode it or read it before `add_order`.
     /// - `filled_quantity` is how much of the incoming order matched.
     pub fn place(
-        book: &mut OrderBook,
+        book: &mut TestBook,
         order_type: OrderType,
         side: Side,
         price: u64,
@@ -1008,10 +1126,31 @@ mod ledger_tests {
         price: u64,
         size: u64,
     ) -> Result<MatchResponse, RejectReason> {
+        submit_pair(engine, account_id, TEST_PAIR, side, order_type, price, size)
+    }
+
+    // The update for one order out of a command's updates.
+    fn find_update(res: &MatchResponse, order_id: u64) -> OrderUpdate {
+        *res.updates
+            .iter()
+            .find(|u| u.order_id == order_id)
+            .expect("no update for that order")
+    }
+
+    // Same as `submit` but for an explicit market.
+    fn submit_pair(
+        engine: &mut Engine,
+        account_id: AccountId,
+        pair: Pair,
+        side: Side,
+        order_type: OrderType,
+        price: u64,
+        size: u64,
+    ) -> Result<MatchResponse, RejectReason> {
         engine.place_order(
             account_id,
             &OrderRequest {
-                base_currency: Currency::SOL,
+                pair,
                 order_type,
                 side,
                 price,
@@ -1075,6 +1214,96 @@ mod ledger_tests {
         assert_eq!(bal(&engine, 2, Currency::USD), (950, 0));
     }
 
+    // Different markets must never cross: a SOL-USD bid and a SOL-EUR-style
+    // ask at the same price live in separate books and cannot match.
+    #[test]
+    fn test_orders_in_different_pairs_do_not_match() {
+        let mut engine = new_engine();
+        let other = Pair::new(Currency::USD, Currency::SOL); // a different market
+
+        engine.ledger.deposit(Currency::SOL, 2, 10);
+        submit_pair(
+            &mut engine,
+            2,
+            TEST_PAIR,
+            Side::Ask,
+            OrderType::Limit,
+            100,
+            10,
+        )
+        .unwrap();
+
+        // Same price, other market, funded — must not touch the SOL-USD ask.
+        engine.ledger.deposit(Currency::SOL, 1, 1000);
+        let res = submit_pair(&mut engine, 1, other, Side::Bid, OrderType::Limit, 100, 10).unwrap();
+
+        assert!(res.trades.is_empty(), "orders crossed between markets");
+        assert_eq!(engine.books.len(), 2, "each pair gets its own book");
+        // Both still rest, each in its own book.
+        assert_eq!(engine.books[&TEST_PAIR].asks.get(&100).unwrap().len(), 1);
+        assert_eq!(engine.books[&other].bids.get(&100).unwrap().len(), 1);
+    }
+
+    // Order ids come from one engine-wide counter, so they're unique across books.
+    #[test]
+    fn test_order_ids_unique_across_pairs() {
+        let mut engine = new_engine();
+        let other = Pair::new(Currency::USD, Currency::SOL);
+
+        // An Ask reserves the pair's base: SOL for SOL-USD, USD for USD-SOL.
+        engine.ledger.deposit(Currency::SOL, 1, 100);
+        engine.ledger.deposit(Currency::USD, 1, 100);
+        let a = submit_pair(
+            &mut engine,
+            1,
+            TEST_PAIR,
+            Side::Ask,
+            OrderType::Limit,
+            100,
+            1,
+        )
+        .unwrap();
+        let b = submit_pair(&mut engine, 1, other, Side::Ask, OrderType::Limit, 100, 1).unwrap();
+
+        assert_ne!(a.order_id, b.order_id);
+    }
+
+    // Cancel carries only an order_id — the engine resolves the market itself,
+    // and releases the reserve in that market's currency.
+    #[test]
+    fn test_cancel_routes_to_correct_pair() {
+        let mut engine = new_engine();
+        let other = Pair::new(Currency::USD, Currency::SOL);
+
+        // Rest a bid in `other`, which reserves its quote (SOL).
+        engine.ledger.deposit(Currency::SOL, 1, 1000);
+        let res = submit_pair(&mut engine, 1, other, Side::Bid, OrderType::Limit, 10, 5).unwrap();
+        assert_eq!(bal(&engine, 1, Currency::SOL), (950, 50));
+
+        assert!(
+            engine
+                .cancel_order(
+                    1,
+                    &CancelRequest {
+                        order_id: res.order_id
+                    }
+                )
+                .is_some()
+        );
+        // Released back into SOL (that market's quote), not USD.
+        assert_eq!(bal(&engine, 1, Currency::SOL), (1000, 0));
+    }
+
+    // A market must price one thing in another.
+    #[test]
+    fn test_same_base_and_quote_rejected() {
+        let mut engine = new_engine();
+        engine.ledger.deposit(Currency::SOL, 1, 100);
+        let bad = Pair::new(Currency::SOL, Currency::SOL);
+        let res = submit_pair(&mut engine, 1, bad, Side::Ask, OrderType::Limit, 10, 1);
+        assert!(matches!(res, Err(RejectReason::InvalidPair)));
+    }
+
     // A resting limit buy holds its full reserve; cancelling returns it.
     #[test]
     fn test_cancel_releases_reserve() {
@@ -1083,15 +1312,95 @@ mod ledger_tests {
         let res = submit(&mut engine, 1, Side::Bid, OrderType::Limit, 100, 10).unwrap();
         assert_eq!(bal(&engine, 1, Currency::USD), (0, 1000)); // fully held
 
-        let ok = engine.cancel_order(
-            1,
-            &CancelRequest {
-                order_id: res.order_id,
-                base_currency: Currency::SOL,
-            },
-        );
+        let ok = engine
+            .cancel_order(
+                1,
+                &CancelRequest {
+                    order_id: res.order_id,
+                },
+            )
+            .is_some();
         assert!(ok);
         assert_eq!(bal(&engine, 1, Currency::USD), (1000, 0)); // hold released
+    }
+
+    // A partial fill reports cumulative filled_qty and PartiallyFilled on the
+    // maker; the taker that consumed it is Filled.
+    #[test]
+    fn test_partial_fill_updates_are_cumulative() {
+        let mut engine = new_engine();
+        engine.ledger.deposit(Currency::SOL, 2, 20);
+        let maker = submit(&mut engine, 2, Side::Ask, OrderType::Limit, 100, 20).unwrap();
+
+        engine.ledger.deposit(Currency::USD, 1, 1000);
+        let taker = submit(&mut engine, 1, Side::Bid, OrderType::Limit, 100, 6).unwrap();
+
+        let m = find_update(&taker, maker.order_id);
+        assert_eq!((m.filled_qty, m.remaining_size), (6, 14));
+        assert_eq!(m.status, OrderStatus::PartiallyFilled);
+
+        let t = find_update(&taker, taker.order_id);
+        assert_eq!((t.filled_qty, t.remaining_size), (6, 0));
+        assert_eq!(t.status, OrderStatus::Filled);
+
+        // Hitting the same maker again accumulates rather than restarting.
+        let taker2 = submit(&mut engine, 1, Side::Bid, OrderType::Limit, 100, 4).unwrap();
+        let m2 = find_update(&taker2, maker.order_id);
+        assert_eq!((m2.filled_qty, m2.remaining_size), (10, 10));
+    }
+
+    // A resting limit order that nothing touched needs no update — OrderAccepted
+    // already said open/0.
+    #[test]
+    fn test_untouched_resting_order_emits_no_update() {
+        let mut engine = new_engine();
+        engine.ledger.deposit(Currency::SOL, 1, 10);
+        let res = submit(&mut engine, 1, Side::Ask, OrderType::Limit, 100, 10).unwrap();
+        assert!(res.updates.is_empty());
+    }
+
+    // A market order's unfilled remainder never rests, so it's terminal AND its
+    // reserve must come back — otherwise it's locked forever.
+    #[test]
+    fn test_market_leftover_is_cancelled_and_reserve_released() {
+        let mut engine = new_engine();
+        // Only 4 of the 10 can fill.
+        engine.ledger.deposit(Currency::USD, 2, 1000);
+        submit(&mut engine, 2, Side::Bid, OrderType::Limit, 100, 4).unwrap();
+
+        engine.ledger.deposit(Currency::SOL, 1, 10);
+        let res = submit(&mut engine, 1, Side::Ask, OrderType::Market, 0, 10).unwrap();
+
+        let t = find_update(&res, res.order_id);
+        assert_eq!((t.filled_qty, t.remaining_size), (4, 6));
+        assert_eq!(t.status, OrderStatus::Cancelled);
+
+        // 4 SOL sold, 6 back to available — nothing stuck in reserved.
+        assert_eq!(bal(&engine, 1, Currency::SOL), (6, 0));
+        assert_eq!(bal(&engine, 1, Currency::USD), (400, 0));
+    }
+
+    // Cancelling reports the fills it kept plus the released remainder.
+    #[test]
+    fn test_cancel_reports_partial_fill_then_cancelled() {
+        let mut engine = new_engine();
+        engine.ledger.deposit(Currency::SOL, 1, 10);
+        let resting = submit(&mut engine, 1, Side::Ask, OrderType::Limit, 100, 10).unwrap();
+
+        engine.ledger.deposit(Currency::USD, 2, 1000);
+        submit(&mut engine, 2, Side::Bid, OrderType::Limit, 100, 3).unwrap();
+
+        let (_, order) = engine
+            .cancel_order(
+                1,
+                &CancelRequest {
+                    order_id: resting.order_id,
+                },
+            )
+            .unwrap();
+        assert_eq!(order.size - order.remaining_size, 3); // kept its 3 fills
+        assert_eq!(order.remaining_size, 7);
+        assert_eq!(bal(&engine, 1, Currency::SOL), (7, 0)); // remainder released
     }
 
     // Conservation: a trade moves money but never creates or destroys it.

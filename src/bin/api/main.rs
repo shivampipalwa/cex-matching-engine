@@ -13,7 +13,7 @@ use matching_engine::types::{
     Command::{self},
     CommandEnvelope,
     CommandResponse::{self},
-    Currency, OrderRequest, OrderType, ResponseEnvelope, Side,
+    OrderRequest, OrderType, Pair, ResponseEnvelope, Side,
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 use serde::Deserialize;
@@ -27,7 +27,7 @@ use std::{
 use tokio::{sync::oneshot, time::timeout};
 use uuid::Uuid;
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, ClientOrderId};
 
 /// How long a handler waits for the engine's reply before giving up.
 /// On timeout we return 504 — the command may still be durably logged and
@@ -57,8 +57,7 @@ struct AppState {
 /// Request body for `POST /orders`. Carries intent and the client-supplied idempotency key.
 #[derive(Deserialize)]
 struct PlaceOrderBody {
-    client_order_id: u64,
-    base_currency: Currency,
+    pair: Pair,
     order_type: OrderType,
     side: Side,
     price: u64,
@@ -135,18 +134,18 @@ async fn run_result_subscriber(client: Client, pending: Pending) -> Result<(), r
 async fn place_order(
     State(mut state): State<AppState>,
     AuthUser(account_id): AuthUser,
+    ClientOrderId(client_order_id): ClientOrderId,
     Json(body): Json<PlaceOrderBody>,
 ) -> impl IntoResponse {
     let PlaceOrderBody {
-        client_order_id,
-        base_currency,
+        pair,
         order_type,
         side,
         price,
         size,
     } = body;
     let command = Command::Place(OrderRequest {
-        base_currency,
+        pair,
         order_type,
         side,
         price,

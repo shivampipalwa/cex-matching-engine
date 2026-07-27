@@ -1,11 +1,5 @@
-use matching_engine::{
-    engine::run_engine,
-    types::{Engine, Ledger, OrderBook},
-};
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    error::Error,
-};
+use matching_engine::{engine::run_engine, types::Engine};
+use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -33,19 +27,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let engine = Engine {
-        book: OrderBook {
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
-            order_index: HashMap::new(),
-            next_order_id: 0,
-        },
-        ledger: Ledger {
-            balances: HashMap::new(),
-            dirty: HashSet::new(),
-        },
-        dedup: HashSet::new(),
-    };
+    let engine = Engine::new();
 
     run_engine(engine, read_conn, pub_conn).await?;
     Ok(())

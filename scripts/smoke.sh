@@ -26,14 +26,12 @@ pass() { echo "  ✓ $1"; }
 fail() { echo "  ✗ $1"; exit 1; }
 assert_eq() { [[ "$2" == "$3" ]] && pass "$1 ($2)" || fail "$1: expected '$3', got '$2'"; }
 
-# POST helper: prints "<body>\n<http_code>". Args: url, json, [auth header]
+# POST helper: prints "<body>\n<http_code>". Args: url, json, [header]...
 post() {
-  local url="$1" body="$2" auth="${3:-}"
-  if [[ -n "$auth" ]]; then
-    curl -s -w '\n%{http_code}' -X POST "$url" -H 'content-type: application/json' -H "$auth" -d "$body"
-  else
-    curl -s -w '\n%{http_code}' -X POST "$url" -H 'content-type: application/json' -d "$body"
-  fi
+  local url="$1" body="$2"; shift 2
+  local hdrs=(-H 'content-type: application/json')
+  local h; for h in "$@"; do [[ -n "$h" ]] && hdrs+=(-H "$h"); done
+  curl -s -w '\n%{http_code}' -X POST "$url" "${hdrs[@]}" -d "$body"
 }
 wait_for() { # poll a command until it succeeds, up to ~15s
   for _ in $(seq 1 50); do "$@" >/dev/null 2>&1 && return 0; sleep 0.3; done
@@ -84,18 +82,21 @@ pass "deposits seeded (acct1 1000 USD, acct2 10 SOL)"
 
 echo "== 7. orders (identity from the JWT) =="
 # seller (acct 2) rests an ask
-resp=$(post "$API/orders" '{"client_order_id":1,"base_currency":"SOL","order_type":"Limit","side":"Ask","price":100,"size":10}' "Authorization: Bearer $TOK2")
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Ask","price":100,"size":10}' "Authorization: Bearer $TOK2" "X-Client-Order-Id: 1")
 assert_eq "ask accepted"     "$(echo "$resp" | tail -1)" "200"
 assert_eq "ask rests (fill 0)" "$(echo "$resp" | head -1 | jq .filled_qty)" "0"
 # buyer (acct 1) crosses and fills
-resp=$(post "$API/orders" '{"client_order_id":2,"base_currency":"SOL","order_type":"Limit","side":"Bid","price":100,"size":10}' "Authorization: Bearer $TOK1")
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":100,"size":10}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 2")
 assert_eq "bid accepted"     "$(echo "$resp" | tail -1)" "200"
 assert_eq "bid fills 10"     "$(echo "$resp" | head -1 | jq .filled_qty)" "10"
 # no token -> 401
-code=$(post "$API/orders" '{"client_order_id":3,"base_currency":"SOL","order_type":"Limit","side":"Bid","price":100,"size":10}' | tail -1)
+code=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":100,"size":10}' "X-Client-Order-Id: 3" | tail -1)
 assert_eq "order without token rejected" "$code" "401"
+# missing idempotency header -> 400
+code=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":100,"size":10}' "Authorization: Bearer $TOK1" | tail -1)
+assert_eq "order without X-Client-Order-Id rejected" "$code" "400"
 # idempotency: re-send buyer's order verbatim -> 409
-code=$(post "$API/orders" '{"client_order_id":2,"base_currency":"SOL","order_type":"Limit","side":"Bid","price":100,"size":10}' "Authorization: Bearer $TOK1" | tail -1)
+code=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":100,"size":10}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 2" | tail -1)
 assert_eq "duplicate client_order_id rejected" "$code" "409"
 
 echo "== 8. verify projection =="
@@ -104,6 +105,11 @@ assert_eq "one trade recorded"  "$(psql 'select count(*) from trades')" "1"
 assert_eq "trade price"         "$(psql 'select price from trades')"    "100"
 assert_eq "buyer holds 10 SOL"  "$(psql "select available from balances where account_id=1 and currency='SOL'")" "10"
 assert_eq "seller holds 1000 USD" "$(psql "select available from balances where account_id=2 and currency='USD'")" "1000"
+assert_eq "trade tagged with pair" "$(psql 'select pair from trades')" "SOL-USD"
+# fill tracking: both sides fully filled, cumulative qty recorded
+assert_eq "both orders filled"   "$(psql "select count(*) from orders where status='filled'")" "2"
+assert_eq "no orders left open"  "$(psql "select count(*) from orders where status='open'")"   "0"
+assert_eq "filled_qty recorded"  "$(psql 'select distinct filled_qty from orders')" "10"
 
 echo
 echo "ALL CHECKS PASSED"

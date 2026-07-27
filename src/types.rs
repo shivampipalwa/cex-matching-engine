@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
+    str::FromStr,
 };
 
 use serde::{Deserialize, Serialize};
@@ -36,8 +37,53 @@ pub struct OrderLocation {
     pub price: u64,
 }
 
+/// A trading pair (market). `base` is what's bought/sold, `quote` is what it's
+/// priced in. symbol string - "SOL-USD".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Pair {
+    pub base: Currency,
+    pub quote: Currency,
+}
+
+impl Pair {
+    pub fn new(base: Currency, quote: Currency) -> Self {
+        Pair { base, quote }
+    }
+    // A market must price one thing in another.
+    pub fn is_valid(&self) -> bool {
+        self.base != self.quote
+    }
+}
+
+impl fmt::Display for Pair {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}-{}", self.base, self.quote)
+    }
+}
+
+impl From<Pair> for String {
+    fn from(p: Pair) -> String {
+        p.to_string()
+    }
+}
+
+impl TryFrom<String> for Pair {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        let Some((base, quote)) = s.split_once('-') else {
+            return Err(format!("pair must look like BASE-QUOTE, got {s:?}"));
+        };
+        Ok(Pair {
+            base: base.parse()?,
+            quote: quote.parse()?,
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct Trade {
+    pub pair: Pair,
     pub price: u64,
     pub qty: u64,
     pub maker_id: u64,
@@ -71,7 +117,7 @@ pub struct ResponseEnvelope {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OrderRequest {
-    pub base_currency: Currency,
+    pub pair: Pair,
     pub order_type: OrderType,
     pub side: Side,
     pub price: u64,
@@ -81,7 +127,6 @@ pub struct OrderRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CancelRequest {
     pub order_id: u64,
-    pub base_currency: Currency,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,15 +146,47 @@ pub enum CommandResponse {
     Cancel(bool),
     Deposit(u64),
     Withdraw(Result<(), RejectReason>),
-    // A (account_id, client_order_id) we've already applied — a lost-ack retry.
-    // No state was touched; the client reconciles the real outcome via query.
     Duplicate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum OrderStatus {
+    Open,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+}
+
+impl fmt::Display for OrderStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = match self {
+            OrderStatus::Open => "open",
+            OrderStatus::PartiallyFilled => "partially_filled",
+            OrderStatus::Filled => "filled",
+            OrderStatus::Cancelled => "cancelled",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Post-command state of one order. `filled_qty` is cumulative so consumers can
+/// `SET` it (idempotent on redelivery) instead of incrementing.
+#[derive(Debug, Clone, Copy)]
+pub struct OrderUpdate {
+    pub order_id: u64,
+    pub account_id: AccountId,
+    pub filled_qty: u64,
+    pub remaining_size: u64,
+    pub status: OrderStatus,
 }
 
 #[derive(Debug)]
 pub struct MatchResponse {
     pub order_id: u64,
     pub trades: Vec<Trade>,
+    /// The taker plus every maker this command touched.
+    pub updates: Vec<OrderUpdate>,
+    pub taker_remaining: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -140,9 +217,35 @@ pub struct Ledger {
 
 #[derive(Debug)]
 pub struct Engine {
-    pub book: OrderBook,
+    /// One book per market. Created on first order for that pair.
+    pub books: HashMap<Pair, OrderBook>,
+    /// Routes a cancel (which carries only an order_id) to the right book.
+    pub order_pair: HashMap<u64, Pair>,
+    /// Global, so ids stay unique across every book.
+    pub next_order_id: u64,
     pub ledger: Ledger,
     pub dedup: HashSet<(AccountId, u64)>,
+}
+
+impl Engine {
+    pub fn new() -> Self {
+        Engine {
+            books: HashMap::new(),
+            order_pair: HashMap::new(),
+            next_order_id: 0,
+            ledger: Ledger {
+                balances: HashMap::new(),
+                dirty: HashSet::new(),
+            },
+            dedup: HashSet::new(),
+        }
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // Stores Orders in a BTreeMap as:
@@ -154,7 +257,22 @@ pub struct OrderBook {
     pub bids: BTreeMap<u64, VecDeque<Order>>,
     pub asks: BTreeMap<u64, VecDeque<Order>>,
     pub order_index: HashMap<u64, OrderLocation>,
-    pub next_order_id: u64,
+}
+
+impl OrderBook {
+    pub fn new() -> Self {
+        OrderBook {
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            order_index: HashMap::new(),
+        }
+    }
+}
+
+impl Default for OrderBook {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,6 +280,7 @@ pub enum RejectReason {
     InsufficientFunds,
     UnsupportedOrderType,
     InvalidAmount,
+    InvalidPair,
 }
 
 // output event stream from engine for db writer, etc.
@@ -177,6 +296,7 @@ pub enum Event {
     OrderAccepted {
         order_id: u64,
         account_id: AccountId,
+        pair: Pair,
         side: Side,
         order_type: OrderType,
         price: u64,
@@ -185,6 +305,14 @@ pub enum Event {
     OrderCancelled {
         order_id: u64,
     },
+    OrderUpdated {
+        order_id: u64,
+        account_id: AccountId,
+        pair: Pair,
+        filled_qty: u64,
+        remaining_qty: u64,
+        status: OrderStatus,
+    },
 }
 
 impl fmt::Display for Currency {
@@ -192,6 +320,17 @@ impl fmt::Display for Currency {
         match self {
             Currency::USD => write!(f, "USD"),
             Currency::SOL => write!(f, "SOL"),
+        }
+    }
+}
+
+impl FromStr for Currency {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "USD" => Ok(Currency::USD),
+            "SOL" => Ok(Currency::SOL),
+            other => Err(format!("unknown currency {other:?}")),
         }
     }
 }
@@ -209,7 +348,7 @@ mod wire_tests {
             account_id: 7,
             client_order_id: 42,
             command: Command::Place(OrderRequest {
-                base_currency: Currency::SOL,
+                pair: Pair::new(Currency::SOL, Currency::USD),
                 order_type: OrderType::Limit,
                 side: Side::Bid,
                 price: 100,
