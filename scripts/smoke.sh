@@ -85,6 +85,11 @@ echo "== 7. orders (identity from the JWT) =="
 resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Ask","price":100,"size":10}' "Authorization: Bearer $TOK2" "X-Client-Order-Id: 1")
 assert_eq "ask accepted"     "$(echo "$resp" | tail -1)" "200"
 assert_eq "ask rests (fill 0)" "$(echo "$resp" | head -1 | jq .filled_qty)" "0"
+# the resting ask must show up in the live book projection WHILE it rests —
+# proves the projection is actually being fed, not just reporting empty.
+sleep 0.5
+book=$(curl -s "$API/book/SOL-USD")
+assert_eq "resting ask visible in book" "$(echo "$book" | jq -c '.asks')" '[{"price":100,"qty":10}]'
 # buyer (acct 1) crosses and fills
 resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":100,"size":10}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 2")
 assert_eq "bid accepted"     "$(echo "$resp" | tail -1)" "200"
@@ -150,6 +155,23 @@ assert_eq "trade tagged with pair" "$(psql 'select pair from trades')" "SOL-USD"
 assert_eq "both orders filled"   "$(psql "select count(*) from orders where status='filled'")" "2"
 assert_eq "no orders left open"  "$(psql "select count(*) from orders where status='open'")"   "0"
 assert_eq "filled_qty recorded"  "$(psql "select distinct filled_qty from orders where status='filled'")" "10"
+
+echo "== 12. book projection (in-memory, public market data) =="
+sleep 1  # let the live tail catch up on the cancel from step 9
+book=$(curl -s "$API/book/SOL-USD")
+assert_eq "book snapshot has a sequence field" "$(echo "$book" | jq 'has("sequence")')" "true"
+# the fill emptied the ask level and the cancel emptied the bid level — the
+# projection must reflect BOTH removals, not just additions.
+assert_eq "SOL-USD book empty after fill+cancel (bids)" "$(echo "$book" | jq '.bids | length')" "0"
+assert_eq "SOL-USD book empty after fill+cancel (asks)" "$(echo "$book" | jq '.asks | length')" "0"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$API/book/NOTREAL-PAIR")
+assert_eq "malformed pair rejected" "$code" "400"
+# a syntactically valid but never-traded pair is an empty book, not an error.
+untraded=$(curl -s -w '\n%{http_code}' "$API/book/USD-SOL")
+assert_eq "untraded pair is 200" "$(echo "$untraded" | tail -1)" "200"
+assert_eq "untraded pair has empty bids" "$(echo "$untraded" | head -1 | jq '.bids | length')" "0"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$API/book/SOL-USD")
+assert_eq "book endpoint requires no auth" "$code" "200"
 
 echo
 echo "ALL CHECKS PASSED"

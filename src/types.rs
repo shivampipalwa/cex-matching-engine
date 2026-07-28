@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side {
     Bid, // Buy
     Ask, // Sell
@@ -187,6 +187,8 @@ pub struct MatchResponse {
     /// The taker plus every maker this command touched.
     pub updates: Vec<OrderUpdate>,
     pub taker_remaining: u64,
+    /// (side, price, new_qty) for every price level this command changed.
+    pub book_deltas: Vec<(Side, u64, u64)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -223,6 +225,9 @@ pub struct Engine {
     pub order_pair: HashMap<u64, Pair>,
     /// Global, so ids stay unique across every book.
     pub next_order_id: u64,
+    /// Sequence stamped on each emitted EventBatch. Engine state, so silent
+    /// replay reproduces the same numbering.
+    pub next_seq: u64,
     pub ledger: Ledger,
     pub dedup: HashSet<(AccountId, u64)>,
 }
@@ -233,6 +238,7 @@ impl Engine {
             books: HashMap::new(),
             order_pair: HashMap::new(),
             next_order_id: 0,
+            next_seq: 0,
             ledger: Ledger {
                 balances: HashMap::new(),
                 dirty: HashSet::new(),
@@ -257,6 +263,10 @@ pub struct OrderBook {
     pub bids: BTreeMap<u64, VecDeque<Order>>,
     pub asks: BTreeMap<u64, VecDeque<Order>>,
     pub order_index: HashMap<u64, OrderLocation>,
+    /// (side, price) levels whose aggregate qty changed this command. Drained
+    /// into BookDelta events by `take_dirty_levels` — same pattern as
+    /// `Ledger.dirty`.
+    pub dirty_levels: HashSet<(Side, u64)>,
 }
 
 impl OrderBook {
@@ -265,6 +275,7 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             order_index: HashMap::new(),
+            dirty_levels: HashSet::new(),
         }
     }
 }
@@ -313,6 +324,26 @@ pub enum Event {
         remaining_qty: u64,
         status: OrderStatus,
     },
+    /// A price level's aggregate quantity changed. `qty` is the level's NEW
+    /// total (0 = level gone) — consumers SET it, they don't accumulate.
+    /// Feeds the book-projection snapshot (M6.4) and, later, the websocket
+    /// delta stream (M7) — same event, two readers.
+    BookDelta {
+        pair: Pair,
+        side: Side,
+        price: u64,
+        qty: u64,
+    },
+}
+
+/// One `events`-stream entry per command. `seq` is engine-assigned (state, not
+/// the Redis id) so it's deterministic under replay — the market-data sequence
+/// consumers reconcile snapshots/deltas against, and the idempotency-key
+/// prefix ("{seq}:{index}") for the events inside.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventBatch {
+    pub seq: u64,
+    pub events: Vec<Event>,
 }
 
 impl fmt::Display for Currency {

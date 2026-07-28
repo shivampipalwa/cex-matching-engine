@@ -1,4 +1,5 @@
 mod auth;
+mod book;
 
 use axum::{
     Json, Router,
@@ -56,6 +57,8 @@ struct AppState {
     pending: Pending,
     pg_pool: PgPool,
     keys: Arc<Keys>,
+    /// In-memory order-book projection, fed by the `events` stream. See `book`.
+    book_store: Arc<book::BookStore>,
 }
 
 /// Request body for `POST /orders`. Carries intent and the client-supplied idempotency key.
@@ -121,11 +124,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         encoding_key: EncodingKey::from_secret(&std::env::var("JWT_SECRET")?.as_bytes()),
         decoding_key: DecodingKey::from_secret(&std::env::var("JWT_SECRET")?.as_bytes()),
     };
+
+    // Book projection: replay `events` once to build the book fully (mirrors
+    // the engine's own recovery), THEN start serving — no request should ever
+    // see a partially-built book. Only after that does the live tail spawn.
+    let book_store = Arc::new(book::BookStore::new());
+    let mut book_conn = client.get_multiplexed_async_connection().await?;
+    let last_id = book::bootstrap(&mut book_conn, &book_store).await?;
+    {
+        let store = book_store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = book::tail(book_conn, store, last_id).await {
+                eprintln!("book projection terminated: {e}");
+            }
+        });
+    }
+
     let state = AppState {
         xadd_conn,
         pending,
         pg_pool,
         keys: Arc::new(keys),
+        book_store,
     };
     let app = Router::new()
         .route("/auth/signup", post(auth::signup))
@@ -136,6 +156,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/deposits", post(deposit))
         .route("/withdrawals", post(withdraw))
         .route("/balances", get(get_balances))
+        .route("/book/:pair", get(book::get_book))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;

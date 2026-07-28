@@ -1,5 +1,5 @@
 use bigdecimal::BigDecimal;
-use matching_engine::types::{Event, OrderType, Side};
+use matching_engine::types::{Event, EventBatch, OrderType, Side};
 use redis::{
     AsyncCommands,
     aio::MultiplexedConnection,
@@ -130,6 +130,11 @@ async fn apply_event(
             .execute(&mut **tx)
             .await?;
         }
+        Event::BookDelta { .. } => {
+            // Consumed by the in-memory book projection in the API process
+            // (M6.4 step 3), not persisted here — book levels are derived,
+            // high-churn state with no query need in Postgres.
+        }
     }
     Ok(())
 }
@@ -185,14 +190,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 };
 
-                let Ok(event) = serde_json::from_str::<Event>(&data).inspect_err(|err| {
-                    println!("Could not deserialize Event; Err:\n{}", err);
+                // One stream entry = one command's whole EventBatch, so this
+                // loop can never see a half-applied command — a transaction
+                // spanning any number of entries still only ever contains
+                // WHOLE commands.
+                let Ok(batch) = serde_json::from_str::<EventBatch>(&data).inspect_err(|err| {
+                    println!("Could not deserialize EventBatch; Err:\n{}", err);
                 }) else {
                     poison.push(entry_id);
                     continue;
                 };
 
-                apply_event(&mut tx, &entry_id, event).await?;
+                for (i, event) in batch.events.into_iter().enumerate() {
+                    // "{seq}:{index}" — engine-derived and stable across
+                    // re-emission, unlike the old raw Redis entry id (which
+                    // stops being unique now that one entry holds many events).
+                    let event_id = format!("{}:{}", batch.seq, i);
+                    apply_event(&mut tx, &event_id, event).await?;
+                }
                 staged.push(entry_id);
             }
         }
