@@ -1,5 +1,6 @@
 mod auth;
 mod book;
+mod ws;
 
 use axum::{
     Json, Router,
@@ -16,7 +17,7 @@ use matching_engine::types::{
     Command::{self},
     CommandEnvelope,
     CommandResponse::{self},
-    Currency, DepositRequest, OrderRequest, OrderType, Pair, ResponseEnvelope, Side,
+    Currency, DepositRequest, EventBatch, OrderRequest, OrderType, Pair, ResponseEnvelope, Side,
     WithdrawRequest,
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
@@ -29,7 +30,10 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{sync::oneshot, time::timeout};
+use tokio::{
+    sync::{broadcast, oneshot},
+    time::timeout,
+};
 use uuid::Uuid;
 
 use crate::auth::{ApiError, AuthUser, ClientOrderId};
@@ -38,6 +42,11 @@ use crate::auth::{ApiError, AuthUser, ClientOrderId};
 /// On timeout we return 504 — the command may still be durably logged and
 /// to mitigate duplicate requests we use 'client_order_id'
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ring buffer size for the websocket. A subscriber that falls
+/// this many batches behind gets `Lagged` and is disconnected (see `ws.rs`)
+/// rather than the channel growing unbounded.
+const EVENT_BROADCAST_CAPACITY: usize = 1024;
 
 /// Correlation-id → one-shot waiting handler. The shared subscriber removes
 /// an entry and fires its sender when the matching replies with the `results`.
@@ -59,6 +68,11 @@ struct AppState {
     keys: Arc<Keys>,
     /// In-memory order-book projection, fed by the `events` stream. See `book`.
     book_store: Arc<book::BookStore>,
+    /// Websocket: very `events` batch, broadcast to whichever
+    /// public/private feed connections currently subscribe. `Sender` is
+    /// `Clone`; each websocket connection calls `.subscribe()` for its own
+    /// `Receiver`. See `ws.rs`.
+    event_tx: broadcast::Sender<Arc<EventBatch>>,
 }
 
 /// Request body for `POST /orders`. Carries intent and the client-supplied idempotency key.
@@ -125,16 +139,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         decoding_key: DecodingKey::from_secret(&std::env::var("JWT_SECRET")?.as_bytes()),
     };
 
-    // Book projection: replay `events` once to build the book fully (mirrors
-    // the engine's own recovery), THEN start serving — no request should ever
-    // see a partially-built book. Only after that does the live tail spawn.
+    // Book projection: replay `events` once to build the book fully (same as
+    // engine's recovery), THEN start serving — no request should ever
+    // see a partially-built book.
     let book_store = Arc::new(book::BookStore::new());
     let mut book_conn = client.get_multiplexed_async_connection().await?;
     let last_id = book::bootstrap(&mut book_conn, &book_store).await?;
+    // Lagging receivers get dropped (see EVENT_BROADCAST_CAPACITY); the
+    // initial receiver returned here is unused — every real subscriber comes
+    // from `event_tx.subscribe()` in a websocket handler.
+    let (event_tx, _) = broadcast::channel::<Arc<EventBatch>>(EVENT_BROADCAST_CAPACITY);
     {
         let store = book_store.clone();
+        let event_tx = event_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = book::tail(book_conn, store, last_id).await {
+            if let Err(e) = book::tail(book_conn, store, last_id, event_tx).await {
                 eprintln!("book projection terminated: {e}");
             }
         });
@@ -146,17 +165,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         pg_pool,
         keys: Arc::new(keys),
         book_store,
+        event_tx,
     };
     let app = Router::new()
         .route("/auth/signup", post(auth::signup))
         .route("/auth/login", post(auth::login))
         .route("/orders", post(place_order).get(get_orders))
-        // axum 0.7 path-param syntax is `:id` ({id} is 0.8+).
         .route("/orders/:id", delete(cancel_order))
         .route("/deposits", post(deposit))
         .route("/withdrawals", post(withdraw))
         .route("/balances", get(get_balances))
         .route("/book/:pair", get(book::get_book))
+        .route("/ws/market/:pair", get(ws::public_market))
+        .route("/ws/orders", get(ws::private_orders))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
@@ -166,7 +187,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// for every request- one task, one pub/sub connection.
-/// `SUBSCRIBE`s to `results` channel, reads the `correlation_id` from
+/// `SUBSCRIBE`s to `results` redis channel, reads the `correlation_id` from
 /// the message body, and sends the reply back to the waiter via sender.
 async fn run_result_subscriber(client: Client, pending: Pending) -> Result<(), redis::RedisError> {
     let mut pubsub = client.get_async_pubsub().await?;
@@ -191,15 +212,7 @@ async fn run_result_subscriber(client: Client, pending: Pending) -> Result<(), r
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Writes: every one rides the same correlation flow, so it lives in one place.
-// ---------------------------------------------------------------------------
-
 /// Log a command and wait for the engine's correlated reply.
-///
-/// Ordering matters: register the waiter BEFORE the XADD, or the engine can
-/// publish the reply before we're listening. Every early exit must drop the
-/// pending entry, else the map leaks.
 async fn submit_command(
     state: &mut AppState,
     account_id: AccountId,
@@ -244,8 +257,6 @@ fn response_for(resp: CommandResponse) -> Response {
     match resp {
         CommandResponse::Place(Ok(r)) => (StatusCode::OK, Json(r)).into_response(),
         CommandResponse::Place(Err(e)) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
-        // false = unknown order OR not the caller's. Same 404 either way, so we
-        // don't leak the existence of other accounts' orders.
         CommandResponse::Cancel(true) => StatusCode::NO_CONTENT.into_response(),
         CommandResponse::Cancel(false) => ApiError::NotFound.into_response(),
         CommandResponse::Deposit(available) => {
@@ -256,6 +267,10 @@ fn response_for(resp: CommandResponse) -> Response {
         CommandResponse::Duplicate => StatusCode::CONFLICT.into_response(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Writes
+// ---------------------------------------------------------------------------
 
 /// `POST /orders`
 async fn place_order(
@@ -333,9 +348,7 @@ async fn withdraw(
 }
 
 // ---------------------------------------------------------------------------
-// Reads: straight off the DB projection, never through the command log — reads
-// need no ordering or durability, and would serialize behind the engine thread.
-// Always scoped by the token's account_id, never a client-supplied one.
+// Reads
 // ---------------------------------------------------------------------------
 
 /// `GET /balances`

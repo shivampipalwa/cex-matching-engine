@@ -263,8 +263,8 @@ pub struct OrderBook {
     pub bids: BTreeMap<u64, VecDeque<Order>>,
     pub asks: BTreeMap<u64, VecDeque<Order>>,
     pub order_index: HashMap<u64, OrderLocation>,
-    /// (side, price) levels whose aggregate qty changed this command. Drained
-    /// into BookDelta events by `take_dirty_levels` — same pattern as
+    /// (side, price) levels whose aggregate qty changed due to current command.
+    /// Drained into BookDelta events by `take_dirty_levels` — this patter is same as
     /// `Ledger.dirty`.
     pub dirty_levels: HashSet<(Side, u64)>,
 }
@@ -325,9 +325,7 @@ pub enum Event {
         status: OrderStatus,
     },
     /// A price level's aggregate quantity changed. `qty` is the level's NEW
-    /// total (0 = level gone) — consumers SET it, they don't accumulate.
-    /// Feeds the book-projection snapshot (M6.4) and, later, the websocket
-    /// delta stream (M7) — same event, two readers.
+    /// total (remove level if qty=0)
     BookDelta {
         pair: Pair,
         side: Side,
@@ -336,10 +334,8 @@ pub enum Event {
     },
 }
 
-/// One `events`-stream entry per command. `seq` is engine-assigned (state, not
-/// the Redis id) so it's deterministic under replay — the market-data sequence
-/// consumers reconcile snapshots/deltas against, and the idempotency-key
-/// prefix ("{seq}:{index}") for the events inside.
+/// One `events`-stream entry per command. `seq` is engine-assigned (its state, not
+/// the Redis id) so it's deterministic under replay
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventBatch {
     pub seq: u64,

@@ -173,5 +173,33 @@ assert_eq "untraded pair has empty bids" "$(echo "$untraded" | head -1 | jq '.bi
 code=$(curl -s -o /dev/null -w '%{http_code}' "$API/book/SOL-USD")
 assert_eq "book endpoint requires no auth" "$code" "200"
 
+echo "== 13. websocket feeds (M7: public market data + private order updates) =="
+node scripts/ws_smoke.mjs "$API" "SOL-USD" "$TOK1" "$TOK2" "not-a-real-jwt" \
+  >/tmp/smoke_ws.json 2>/tmp/smoke_ws.log &
+WSPID=$!
+wait_for grep -q READY /tmp/smoke_ws.log
+pass "public + both private connections open, private feeds authenticated"
+
+# Top up first: by this point the buyer's balance has been spent down by
+# earlier sections, and an order silently rejected for insufficient funds
+# would emit nothing on any feed, making this check pass for the wrong reason.
+post "$API/deposits" '{"amount":1000,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 29" >/dev/null
+
+# A distinctive order (price 50, unused anywhere else in this script) so the
+# resulting events are unambiguous.
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":50,"size":3}' \
+  "Authorization: Bearer $TOK1" "X-Client-Order-Id: 30")
+assert_eq "ws-probe order accepted" "$(echo "$resp" | tail -1)" "200"
+wait "$WSPID"
+
+assert_eq "bad-token private connection closed" "$(jq '.badClosed' /tmp/smoke_ws.json)" "true"
+assert_eq "public feed saw the book delta" \
+  "$(jq '[.market[] | select(.type=="book_delta" and .price==50 and .qty==3)] | length' /tmp/smoke_ws.json)" "1"
+assert_eq "buyer's private feed saw OrderAccepted" \
+  "$(jq '[.orders1[] | select(.OrderAccepted.price==50)] | length' /tmp/smoke_ws.json)" "1"
+# privacy: the seller's own private connection must never see the buyer's order.
+assert_eq "seller's private feed did NOT see buyer's order" \
+  "$(jq '[.orders2[] | select(.OrderAccepted.price==50)] | length' /tmp/smoke_ws.json)" "0"
+
 echo
 echo "ALL CHECKS PASSED"

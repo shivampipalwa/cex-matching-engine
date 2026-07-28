@@ -22,6 +22,7 @@ use redis::{
     streams::{StreamRangeReply, StreamReadOptions, StreamReadReply},
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 use crate::AppState;
 use crate::auth::ApiError;
@@ -154,11 +155,16 @@ pub(crate) async fn bootstrap(
     Ok(last_id)
 }
 
-/// Live tail: plain `XREAD BLOCK` starting just after `last_id`.
+/// Live tail: plain `XREAD BLOCK` starting just after `last_id`. Also fans
+/// every batch out to `event_tx` — the M7 websocket feeds' shared broadcast
+/// channel — so there's still only one Redis connection / one task reading
+/// `events` per API process; websockets are a second reader of the same tail,
+/// not a second tailer.
 pub(crate) async fn tail(
     mut conn: MultiplexedConnection,
     store: Arc<BookStore>,
     mut last_id: String,
+    event_tx: broadcast::Sender<Arc<EventBatch>>,
 ) -> Result<(), Box<dyn Error>> {
     let opts = StreamReadOptions::default().block(5000);
     loop {
@@ -175,6 +181,9 @@ pub(crate) async fn tail(
                     continue;
                 };
                 store.apply_batch(&batch);
+                // Errors only when there are currently zero receivers — not a
+                // failure, just nobody subscribed at this instant.
+                let _ = event_tx.send(Arc::new(batch));
             }
         }
     }

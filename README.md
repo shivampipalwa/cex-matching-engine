@@ -41,9 +41,17 @@ Actively being built, milestone by milestone. Currently:
 - ✅ Account-scoped reads off the Postgres projection: `GET /balances`, `GET /orders`
 - ✅ Order fill tracking (`filled_qty`, `open`/`partially_filled`/`filled`/`cancelled`)
 - ✅ In-memory order-book projection per API process, fed by the event stream,
-  with `GET /book/:pair` (price-level snapshot + a sequence number for future
+  with `GET /book/:pair` (price-level snapshot + a sequence number for
   snapshot/delta reconciliation)
-- ⬜ WebSocket feeds (public book deltas + trade tape, private order updates)
+- ✅ WebSocket feeds, both fed by the same tail that drives the book
+  projection (one Redis connection, fanned out over a `broadcast` channel):
+  - `GET /ws/market/:pair` — public book deltas + trade tape, no auth, one
+    connection per pair, each message tagged with the sequence number to
+    reconcile against a `GET /book/:pair` snapshot
+  - `GET /ws/orders` — private per-account order updates
+    (`OrderAccepted`/`OrderUpdated`). No `Authorization` header on a
+    websocket upgrade (browsers can't set one), so auth is a first-message
+    handshake: the client's first frame must be `{"token": "<jwt>"}`
 - ⬜ Latency benchmarks, observability, one-engine-per-pair horizontal scaling
 
 ## Architecture at a glance
@@ -65,7 +73,10 @@ current shape.)*
   a background task tails `events` and maintains price-level aggregates purely
   in that process's memory (no network hop for a book read; scales for free
   with API instance count, since a plain `XREAD` — no consumer group — means
-  every instance sees every event independently).
+  every instance sees every event independently). That same tail task also
+  fans every batch into a `broadcast` channel, which is what feeds the
+  websocket handlers (`GET /ws/market/:pair`, `GET /ws/orders`) — one Redis
+  connection, multiple readers of its output.
 - **`db_writer`** consumes the same `events` Stream and projects trades,
   balances, and orders into Postgres, one Postgres transaction per command
   batch.
@@ -115,6 +126,14 @@ curl -X POST localhost:3000/orders \
   -d '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":100,"size":10}'
 
 curl localhost:3000/book/SOL-USD
+
+# public feed — book deltas + trade tape for one pair, no auth
+websocat ws://localhost:3000/ws/market/SOL-USD
+
+# private feed — this account's order updates. First frame sent must be the
+# auth message; the upgrade itself carries no credentials.
+websocat ws://localhost:3000/ws/orders
+> {"token":"<token>"}
 ```
 
 You can also inspect the streams directly:
@@ -141,12 +160,17 @@ sequencing (seq assignment, no-seq-for-no-op commands, book-delta dedup).
 ./scripts/smoke.sh
 ```
 
-A ~40-assertion end-to-end smoke test: brings up Redis/Postgres, runs
-migrations, starts all three binaries, then drives the real HTTP API —
-signup/login, an order that rests and one that crosses and fills, deposits,
-withdrawals, ownership-checked cancellation, account-scoped reads, and the
-book projection (including a check that a resting order is visible in
-`GET /book` *before* it's matched, not just absent at the end).
+An end-to-end smoke test: brings up Redis/Postgres, runs migrations, starts
+all three binaries, then drives the real HTTP API — signup/login, an order
+that rests and one that crosses and fills, deposits, withdrawals,
+ownership-checked cancellation, account-scoped reads, the book projection
+(including a check that a resting order is visible in `GET /book` *before*
+it's matched, not just absent at the end), and the two websocket feeds —
+public book-delta delivery, the private first-message auth handshake
+(both a bad token getting closed and a good one getting authenticated),
+and that one account's private feed never sees another account's orders.
+Requires Node ≥ 22 (`scripts/ws_smoke.mjs`, invoked by `smoke.sh`, uses the
+global `WebSocket` client) in addition to Redis/Postgres/`sqlx-cli`/`jq`.
 
 ## Project layout
 
@@ -163,8 +187,10 @@ src/
     └── api/
         ├── main.rs    # HTTP server: AppState, the correlation-flow helper, all handlers
         ├── auth.rs    # JWT sign/verify, argon2 hashing, AuthUser/ClientOrderId extractors
-        └── book.rs    # in-memory order-book projection + GET /book/:pair
+        ├── book.rs    # in-memory order-book projection + GET /book/:pair
+        └── ws.rs      # GET /ws/market/:pair (public) + GET /ws/orders (private) handlers
 
 migrations/            # sqlx migrations (users, trades, balances, orders)
 scripts/smoke.sh        # end-to-end smoke test against the real running system
+scripts/ws_smoke.mjs    # smoke.sh's websocket-feed helper (Node's global WebSocket)
 ```
