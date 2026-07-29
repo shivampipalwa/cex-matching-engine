@@ -94,6 +94,7 @@ struct DepositBody {
 #[derive(Deserialize)]
 struct WithdrawBody {
     amount: u64,
+    currency: Currency,
 }
 
 // Projection rows. Amounts are NUMERIC in Postgres; BigDecimal keeps them exact.
@@ -331,7 +332,7 @@ async fn deposit(
     }
 }
 
-/// `POST /withdrawals` — USD only for now (the ledger's withdraw is hardcoded).
+/// `POST /withdrawals`
 async fn withdraw(
     State(mut state): State<AppState>,
     AuthUser(account_id): AuthUser,
@@ -340,6 +341,7 @@ async fn withdraw(
 ) -> Response {
     let command = Command::Withdraw(WithdrawRequest {
         amount: body.amount,
+        currency: body.currency,
     });
     match submit_command(&mut state, account_id, client_order_id, command).await {
         Ok(resp) => response_for(resp),

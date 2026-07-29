@@ -1,6 +1,6 @@
 use crate::types::{
-    AccountId, Balance, CancelRequest, Command, CommandEnvelope, CommandResponse, Currency, Engine,
-    Event, EventBatch, Ledger, MatchResponse, Order, OrderBook, OrderLocation, OrderRequest,
+    AccountId, Balance, CancelRequest, Command, CommandEnvelope, CommandResponse, Currency, Dedup,
+    Engine, Event, EventBatch, Ledger, MatchResponse, Order, OrderBook, OrderLocation, OrderRequest,
     OrderStatus, OrderType, OrderUpdate, Pair, PlaceOrderResponse, RejectReason, ResponseEnvelope,
     Side, Trade,
 };
@@ -266,17 +266,22 @@ impl Ledger {
         balance.available
     }
 
-    fn withdraw(&mut self, account_id: AccountId, amount: u64) -> Result<(), RejectReason> {
+    fn withdraw(
+        &mut self,
+        account_id: AccountId,
+        currency: Currency,
+        amount: u64,
+    ) -> Result<(), RejectReason> {
         let acc_balances = self.balances.entry(account_id).or_default();
-        let usd_balance = acc_balances.entry(Currency::USD).or_insert(Balance {
+        let balance = acc_balances.entry(currency).or_insert(Balance {
             available: 0,
             reserved: 0,
         });
-        if usd_balance.available < amount {
+        if balance.available < amount {
             return Err(RejectReason::InsufficientFunds);
         }
-        usd_balance.available -= amount;
-        self.dirty.insert((account_id, Currency::USD));
+        balance.available -= amount;
+        self.dirty.insert((account_id, currency));
         Ok(())
     }
 
@@ -324,54 +329,60 @@ impl Ledger {
 
     fn settle(&mut self, pair: Pair, trade: &Trade) {
         let (currency, quote) = (pair.base, pair.quote);
+        // place_order() rejects any order whose own price*size overflows, and a
+        // trade's price/qty are each bounded by the crossing order's price/size —
+        // so this can only fire if that guard was bypassed, i.e. a real bug.
+        let cost = trade
+            .price
+            .checked_mul(trade.qty)
+            .expect("trade cost overflow should have been rejected at order placement");
         match trade.taker_side {
             Side::Bid => {
-                // update taker's ledger
                 let takers_balance = self.balances.entry(trade.taker_account).or_default();
-                let takers_quote_balance = takers_balance.entry(quote).or_default();
-                takers_quote_balance.reserved -= trade.price * trade.qty; //overflow
-                let takers_base_balance = takers_balance.entry(currency).or_default();
-                takers_base_balance.available += trade.qty;
+                takers_balance.entry(quote).or_default().reserved -= cost;
+                takers_balance.entry(currency).or_default().available += trade.qty;
 
-                //update maker's ledger
                 let makers_balance = self.balances.entry(trade.maker_account).or_default();
-                let makers_quote_balance = makers_balance.entry(quote).or_default();
-                makers_quote_balance.available += trade.price * trade.qty; //overflow
-                let makers_base_balance = makers_balance.entry(currency).or_default();
-                makers_base_balance.reserved -= trade.qty;
-
-                // record dirty
-                self.dirty.insert((trade.taker_account, quote));
-                self.dirty.insert((trade.taker_account, currency));
-                self.dirty.insert((trade.maker_account, quote));
-                self.dirty.insert((trade.maker_account, currency));
+                makers_balance.entry(quote).or_default().available += cost;
+                makers_balance.entry(currency).or_default().reserved -= trade.qty;
             }
             Side::Ask => {
-                // update taker's ledger
                 let takers_balance = self.balances.entry(trade.taker_account).or_default();
-                let takers_quote_balance = takers_balance.entry(quote).or_default();
-                takers_quote_balance.available += trade.price * trade.qty; //overflow
-                let takers_base_balance = takers_balance.entry(currency).or_default();
-                takers_base_balance.reserved -= trade.qty;
+                takers_balance.entry(quote).or_default().available += cost;
+                takers_balance.entry(currency).or_default().reserved -= trade.qty;
 
-                //update maker;s ledger
                 let makers_balance = self.balances.entry(trade.maker_account).or_default();
-                let makers_quote_balance = makers_balance.entry(quote).or_default();
-                makers_quote_balance.reserved -= trade.price * trade.qty; //overflow
-                let makers_base_balance = makers_balance.entry(currency).or_default();
-                makers_base_balance.available += trade.qty;
-
-                // record dirty
-                self.dirty.insert((trade.taker_account, quote));
-                self.dirty.insert((trade.taker_account, currency));
-                self.dirty.insert((trade.maker_account, quote));
-                self.dirty.insert((trade.maker_account, currency));
+                makers_balance.entry(quote).or_default().reserved -= cost;
+                makers_balance.entry(currency).or_default().available += trade.qty;
             }
         }
+        self.dirty.insert((trade.taker_account, quote));
+        self.dirty.insert((trade.taker_account, currency));
+        self.dirty.insert((trade.maker_account, quote));
+        self.dirty.insert((trade.maker_account, currency));
     }
 
     pub fn take_dirty(&mut self) -> Vec<(AccountId, Currency)> {
         self.dirty.drain().collect()
+    }
+}
+
+/// Most recent client_order_ids kept per account before older ones are evicted.
+const DEDUP_WINDOW: usize = 1000;
+
+impl Dedup {
+    /// Returns false if this (account_id, client_order_id) was already seen.
+    fn insert(&mut self, account_id: AccountId, client_order_id: u64) -> bool {
+        if !self.seen.insert((account_id, client_order_id)) {
+            return false;
+        }
+        let recent = self.order.entry(account_id).or_default();
+        recent.push_back(client_order_id);
+        if recent.len() > DEDUP_WINDOW {
+            let evicted = recent.pop_front().expect("just checked len > 0");
+            self.seen.remove(&(account_id, evicted));
+        }
+        true
     }
 }
 
@@ -389,15 +400,19 @@ impl Engine {
             return Err(RejectReason::UnsupportedOrderType);
         }
 
-        // reserve funds
+        // Checked for both sides: a trade's price*qty is always bounded by
+        // either the maker's or the taker's own price*size, so rejecting any
+        // order whose own product overflows here keeps settle() safe too.
+        let quote_amount = req
+            .price
+            .checked_mul(req.size)
+            .ok_or(RejectReason::InvalidAmount)?;
+
         match req.side {
             Side::Bid => {
-                // reserve quote
-                self.ledger
-                    .reserve(account_id, req.pair.quote, req.price * req.size)?; // overflow
+                self.ledger.reserve(account_id, req.pair.quote, quote_amount)?;
             }
             Side::Ask => {
-                // reserve base
                 self.ledger.reserve(account_id, req.pair.base, req.size)?;
             }
         }
@@ -482,7 +497,7 @@ pub fn apply(
     // Idempotency: `insert` returns false if the key was already present, i.e.
     // this is a lost-ack retry. Bail before touching any state or emitting
     // anything.
-    if !engine.dedup.insert((account_id, client_order_id)) {
+    if !engine.dedup.insert(account_id, client_order_id) {
         return (CommandResponse::Duplicate, None);
     }
 
@@ -569,7 +584,9 @@ pub fn apply(
             CommandResponse::Deposit(available_balance)
         }
         Command::Withdraw(withdraw_request) => {
-            let res = engine.ledger.withdraw(account_id, withdraw_request.amount);
+            let res = engine
+                .ledger
+                .withdraw(account_id, withdraw_request.currency, withdraw_request.amount);
             CommandResponse::Withdraw(res)
         }
     };
@@ -1484,6 +1501,35 @@ mod ledger_tests {
         assert_eq!(bal(&engine, 1, Currency::SOL), (7, 0)); // remainder released
     }
 
+    // An order whose own price*size would overflow u64 is rejected before
+    // anything is reserved or matched — the guard that keeps settle()'s
+    // trade.price*trade.qty from silently wrapping around later.
+    #[test]
+    fn test_order_value_overflow_rejected() {
+        let mut engine = new_engine();
+        let res = submit(&mut engine, 1, Side::Bid, OrderType::Limit, u64::MAX, 2);
+        assert!(matches!(res, Err(RejectReason::InvalidAmount)));
+        assert_eq!(bal(&engine, 1, Currency::USD), (0, 0));
+    }
+
+    // Withdraw is no longer hardcoded to USD.
+    #[test]
+    fn test_withdraw_any_currency() {
+        let mut engine = new_engine();
+        engine.ledger.deposit(Currency::SOL, 1, 10);
+        assert!(engine.ledger.withdraw(1, Currency::SOL, 4).is_ok());
+        assert_eq!(bal(&engine, 1, Currency::SOL), (6, 0));
+        // still enforces the balance it's actually checking against
+        assert!(matches!(
+            engine.ledger.withdraw(1, Currency::SOL, 100),
+            Err(RejectReason::InsufficientFunds)
+        ));
+        assert!(matches!(
+            engine.ledger.withdraw(1, Currency::USD, 1),
+            Err(RejectReason::InsufficientFunds)
+        ));
+    }
+
     // Conservation: a trade moves money but never creates or destroys it.
     #[test]
     fn test_conservation_across_trade() {
@@ -1570,6 +1616,32 @@ mod apply_tests {
         assert!(events.iter().any(|e| matches!(e, Event::BalanceChanged { .. })));
         assert!(!events.iter().any(|e| matches!(e, Event::Trade(_))));
         assert!(!events.iter().any(|e| matches!(e, Event::OrderUpdated { .. })));
+    }
+
+    // The dedup set is bounded to DEDUP_WINDOW entries per account (M8): once
+    // an account's (client_order_id)th command pushes it past the window, the
+    // oldest is evicted and becomes reusable — proving eviction actually
+    // happens, not just that recent duplicates are still caught.
+    #[test]
+    fn test_dedup_window_evicts_oldest_client_order_id() {
+        let mut engine = Engine::new();
+
+        for client_order_id in 1..=DEDUP_WINDOW as u64 {
+            let (resp, _) = apply(&mut engine, 1, client_order_id, deposit_cmd(1));
+            assert!(matches!(resp, CommandResponse::Deposit(_)));
+        }
+        // Still within the window: a genuine duplicate is still caught.
+        let (resp, _) = apply(&mut engine, 1, 1, deposit_cmd(1));
+        assert!(matches!(resp, CommandResponse::Duplicate));
+
+        // One more command evicts client_order_id 1 (the oldest).
+        let (resp, _) = apply(&mut engine, 1, DEDUP_WINDOW as u64 + 1, deposit_cmd(1));
+        assert!(matches!(resp, CommandResponse::Deposit(_)));
+
+        // client_order_id 1 was evicted, so replaying it is treated as new,
+        // not as a duplicate.
+        let (resp, _) = apply(&mut engine, 1, 1, deposit_cmd(1));
+        assert!(matches!(resp, CommandResponse::Deposit(_)));
     }
 
     // A crossing order's accept, trade(s), and both sides' fill updates all

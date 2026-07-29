@@ -107,11 +107,18 @@ assert_eq "duplicate client_order_id rejected" "$code" "409"
 echo "== 8. deposits / withdrawals =="
 code=$(post "$API/deposits" '{"amount":50,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 10" | tail -1)
 assert_eq "deposit accepted" "$code" "200"
-code=$(post "$API/withdrawals" '{"amount":20}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 11" | tail -1)
+code=$(post "$API/withdrawals" '{"amount":20,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 11" | tail -1)
 assert_eq "withdrawal accepted" "$code" "204"
 # more than available -> engine rejects
-code=$(post "$API/withdrawals" '{"amount":999999}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 12" | tail -1)
+code=$(post "$API/withdrawals" '{"amount":999999,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 12" | tail -1)
 assert_eq "overdraft withdrawal rejected" "$code" "400"
+# withdraw is no longer USD-only (M8). Seller's SOL is all reserved/sold by
+# now (section 7's fill), so deposit fresh SOL first rather than assume any
+# is left available.
+code=$(post "$API/deposits" '{"amount":5,"currency":"SOL"}' "Authorization: Bearer $TOK2" "X-Client-Order-Id: 13" | tail -1)
+assert_eq "SOL deposit accepted" "$code" "200"
+code=$(post "$API/withdrawals" '{"amount":3,"currency":"SOL"}' "Authorization: Bearer $TOK2" "X-Client-Order-Id: 14" | tail -1)
+assert_eq "non-USD withdrawal accepted" "$code" "204"
 
 echo "== 9. cancel (ownership enforced by the engine) =="
 # buyer rests a bid that won't cross

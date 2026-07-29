@@ -138,6 +138,7 @@ pub struct DepositRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WithdrawRequest {
     pub amount: u64,
+    pub currency: Currency,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -217,6 +218,15 @@ pub struct Ledger {
     pub dirty: HashSet<(AccountId, Currency)>,
 }
 
+/// Idempotency keys seen so far, bounded to the most recent
+/// `DEDUP_WINDOW` per account instead of growing forever. Eviction is by
+/// insertion count, not wall-clock time, so it stays deterministic under replay.
+#[derive(Debug)]
+pub struct Dedup {
+    pub seen: HashSet<(AccountId, u64)>,
+    pub order: HashMap<AccountId, VecDeque<u64>>,
+}
+
 #[derive(Debug)]
 pub struct Engine {
     /// One book per market. Created on first order for that pair.
@@ -229,7 +239,7 @@ pub struct Engine {
     /// replay reproduces the same numbering.
     pub next_seq: u64,
     pub ledger: Ledger,
-    pub dedup: HashSet<(AccountId, u64)>,
+    pub dedup: Dedup,
 }
 
 impl Engine {
@@ -243,7 +253,10 @@ impl Engine {
                 balances: HashMap::new(),
                 dirty: HashSet::new(),
             },
-            dedup: HashSet::new(),
+            dedup: Dedup {
+                seen: HashSet::new(),
+                order: HashMap::new(),
+            },
         }
     }
 }
