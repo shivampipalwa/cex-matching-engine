@@ -1,99 +1,45 @@
 # matching-engine
 
-A centralized exchange (CEX) backend, built from scratch in Rust — a price-time
-matching engine, an accounts ledger, a REST API with JWT auth, an in-memory
-order-book projection, and a Postgres-backed trade/order history — all wired
-together over durable Redis Streams.
-
-This is a learning project first: the goal is to get fluent in Rust and in the
-distributed-systems ideas that make a real exchange correct (determinism,
-replay, at-least-once delivery, conservation of funds), while ending up with
-something end-to-end and demoable.
-
-For the full design reasoning — every architectural decision and *why* it was
-made that way — see [`ARCHITECTURE.md`](./ARCHITECTURE.md). **Note:**
-`ARCHITECTURE.md` currently only covers the M0–M5 foundation (engine, ledger,
-transport) and is out of sync with everything below M6 onward; the up-to-date
-decision log lives in a local, gitignored `DESIGN.md`. This README is the quick
-tour of what's actually built and runnable today.
+A centralized exchange backend in Rust — a price-time matching engine, an
+accounts ledger, a REST API with JWT auth, public/private websocket feeds,
+and a Postgres-backed trade/order history, wired together over Redis Streams.
 
 ## Status
 
-Actively being built, milestone by milestone. Currently:
+- Price-time matching engine — limit + market orders, partial fills, FIFO
+- Ledger with available/reserved balances (reserve → settle → refund → release)
+- Multiple trading pairs, admin-gated whitelist — nothing trades until listed
+- Three processes (`api`, `engine`, `db_writer`), decoupled over Redis Streams
+- Crash recovery via command-log replay
+- REST API with JWT auth; idempotent writes via `X-Client-Order-Id`
+- Full order lifecycle — place, cancel, deposit, withdraw any currency
+- Account-scoped reads off a Postgres projection
+- In-memory order-book projection with sequence-numbered snapshots
+- Public and private websocket feeds (book/trades, per-account order updates)
+- Overflow-checked order sizing, bounded idempotency-key memory
+- Benchmark suite for the matching engine (`cargo bench`)
 
-- ✅ Price-time matching engine (limit + market orders, partial fills, FIFO)
-- ✅ Accounts ledger (available/reserved balances, reserve → settle → refund → release)
-- ✅ Multiple trading pairs — one order book per market, engine-global order ids,
-  a cancel resolves its own market/currency (never trusts the client for it)
-- ✅ Three-process architecture: `api`, `engine`, `db_writer`, decoupled via Redis
-  - Commands (`Place`, `Cancel`, `Deposit`, `Withdraw`) flow in through a durable
-    Redis Stream, one entry per command
-  - Results flow back through Redis pub/sub, correlated by UUID
-  - The engine emits one `EventBatch` (all of a command's events, engine-assigned
-    `seq`) per command onto a second durable Stream — `db_writer` applies each
-    batch inside one Postgres transaction, so a trade's rows are never visible
-    half-written
-- ✅ Crash recovery (silent replay of the command log to a boundary, then live)
-- ✅ REST API + JWT auth (`/auth/signup`, `/auth/login`), idempotency via a
-  required `X-Client-Order-Id` header on every write
-- ✅ Full order lifecycle: `POST /orders`, `DELETE /orders/:id` (ownership
-  enforced by the engine), `POST /deposits`, `POST /withdrawals`
-- ✅ Account-scoped reads off the Postgres projection: `GET /balances`, `GET /orders`
-- ✅ Order fill tracking (`filled_qty`, `open`/`partially_filled`/`filled`/`cancelled`)
-- ✅ In-memory order-book projection per API process, fed by the event stream,
-  with `GET /book/:pair` (price-level snapshot + a sequence number for
-  snapshot/delta reconciliation)
-- ✅ WebSocket feeds, both fed by the same tail that drives the book
-  projection (one Redis connection, fanned out over a `broadcast` channel):
-  - `GET /ws/market/:pair` — public book deltas + trade tape, no auth, one
-    connection per pair, each message tagged with the sequence number to
-    reconcile against a `GET /book/:pair` snapshot
-  - `GET /ws/orders` — private per-account order updates
-    (`OrderAccepted`/`OrderUpdated`). No `Authorization` header on a
-    websocket upgrade (browsers can't set one), so auth is a first-message
-    handshake: the client's first frame must be `{"token": "<jwt>"}`
-- ✅ Listed-pairs whitelist — no pair is tradeable until an admin lists it via
-  `POST /admin/pairs`/`DELETE /admin/pairs/:pair`, gated by the
-  `ADMIN_ACCOUNT_ID` env var (not a full roles system — there's one admin
-  action). Also: a bounded idempotency-key set (no longer unbounded memory
-  growth), and an overflow guard on order value (`price * size`) checked once
-  at placement rather than left to wrap around silently later.
-- ⬜ Market-buy orders, latency benchmarks, observability,
-  one-engine-per-pair horizontal scaling
+Not yet built: structured logging/metrics, one engine per trading pair.
 
-## Architecture at a glance
+## Architecture
 
-![API and matching engine connected through Redis: the API XADDs commands and SUBSCRIBEs for a response, the engine XREADs commands and PUBLISHes the result](./docs/architecture.png)
+![Clients reach the API over HTTPS and WebSocket. Writes are XADDed to a Redis commands stream, consumed by a single matching engine, whose result is published back to the waiting API handler. The engine XADDs an events stream, which the DB Writer consumes via a consumer group into Postgres, and which the API tails with a plain XREAD to serve the in-memory book and the WebSocket feeds. Auth and account reads go straight from the API to Postgres.](./docs/architecture.svg)
 
-*(Diagram predates `db_writer` and the book projection — see below for the
-current shape.)*
-
-- The **engine** is a single-threaded process that owns all state (order books,
-  the ledger, dedup/idempotency state) exclusively. It reads commands off the
-  `commands` Stream in order via a consumer group, applies them, publishes the
-  correlated result, and emits one `EventBatch` per command onto the `events`
-  Stream.
-- The **api** process is stateless per-request. Handlers turn a request into a
-  command, register a `oneshot` waiter, `XADD` the command, and await the
-  reply — a single shared background task subscribes once and fans results out
-  to whichever handler is waiting. It also runs an in-memory book projection:
-  a background task tails `events` and maintains price-level aggregates purely
-  in that process's memory (no network hop for a book read; scales for free
-  with API instance count, since a plain `XREAD` — no consumer group — means
-  every instance sees every event independently). That same tail task also
-  fans every batch into a `broadcast` channel, which is what feeds the
-  websocket handlers (`GET /ws/market/:pair`, `GET /ws/orders`) — one Redis
-  connection, multiple readers of its output.
-- **`db_writer`** consumes the same `events` Stream and projects trades,
-  balances, and orders into Postgres, one Postgres transaction per command
-  batch.
-- Because the engine applies every command strictly in log order, replaying
-  that log from the start always reconstructs the same state — the basis for
-  crash recovery, and for a fresh `api`/`db_writer` instance bootstrapping its
-  own projection.
-- Every trade settles through the ledger's `available`/`reserved` balance
-  split, with a conservation invariant enforced in tests (a trade moves money
-  between accounts; it never creates or destroys it).
+- **`engine`** is single-threaded and owns all state — order books, ledger,
+  idempotency set. It reads `commands` in order via a Redis consumer group,
+  applies each one, publishes the result, and emits an event batch onto a
+  second stream.
+- **`api`** is stateless per request. A handler turns a request into a
+  command, writes it to `commands`, and waits for the correlated result over
+  pub/sub. It also tails the event stream to keep an in-memory order-book
+  projection and to fan events out to websocket clients.
+- **`db_writer`** tails the same event stream and projects trades, balances,
+  and orders into Postgres, one transaction per batch.
+- Every command is applied in strict log order, so replaying the log from
+  the start always rebuilds the same state — the basis for crash recovery
+  and for any fresh reader bootstrapping its own projection.
+- Trades settle through the ledger's available/reserved split; conservation
+  (a trade moves money, never creates or destroys it) is enforced in tests.
 
 ## Running it
 
@@ -104,7 +50,7 @@ docker run -d --name pg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=exchange -p 5432:
 docker run -d --name redis -p 6379:6379 redis
 ```
 
-A `.env` in the repo root with:
+A `.env` in the repo root:
 
 ```
 DATABASE_URL=postgres://postgres:pw@127.0.0.1:5432/exchange
@@ -121,15 +67,14 @@ cargo run --bin db_writer
 cargo run --bin api        # serves http://127.0.0.1:3000
 ```
 
-Then, for example:
+Then:
 
 ```bash
 curl -X POST localhost:3000/auth/signup -H 'content-type: application/json' \
   -d '{"email":"me@x.com","password":"pw"}'
 # -> {"token": "..."}
 
-# No pair is tradeable until listed — use the account whose id matches
-# ADMIN_ACCOUNT_ID (e.g. the first signup, id 1, on a fresh DB).
+# nothing is tradeable until listed — use the admin account (id 1 on a fresh DB)
 curl -X POST localhost:3000/admin/pairs \
   -H "Authorization: Bearer <admin token>" -H 'X-Client-Order-Id: 1' \
   -H 'content-type: application/json' -d '{"pair":"SOL-USD"}'
@@ -141,16 +86,13 @@ curl -X POST localhost:3000/orders \
 
 curl localhost:3000/book/SOL-USD
 
-# public feed — book deltas + trade tape for one pair, no auth
-websocat ws://localhost:3000/ws/market/SOL-USD
+websocat ws://localhost:3000/ws/market/SOL-USD   # public: book deltas + trades
 
-# private feed — this account's order updates. First frame sent must be the
-# auth message; the upgrade itself carries no credentials.
-websocat ws://localhost:3000/ws/orders
-> {"token":"<token>"}
+websocat ws://localhost:3000/ws/orders           # private: your order updates
+> {"token":"<token>"}                            # first frame must be this
 ```
 
-You can also inspect the streams directly:
+Inspect the streams directly:
 
 ```bash
 docker exec -it redis redis-cli
@@ -158,39 +100,54 @@ docker exec -it redis redis-cli
 > XRANGE events - +
 ```
 
+Full endpoint and WebSocket reference: [`docs/API.md`](./docs/API.md).
+
 ## Tests
 
 ```bash
 cargo test
 ```
 
-52 unit tests: order book matching (fills, partial fills, FIFO, market
-sweeps), cancellation and ownership, trade pricing, the ledger
-(reserve/settle/refund/release, insufficient-funds rejection, conservation,
-overflow rejection, multi-currency withdraw), multi-pair isolation,
-fill-tracking/status transitions, the event-batch sequencing (seq assignment,
-no-seq-for-no-op commands, book-delta dedup), the bounded dedup window, and
-the listed-pairs whitelist (list/delist, idempotent re-listing, rejection
-before listing and after delisting).
+57 unit tests covering order-book matching, cancellation, trade pricing, the
+ledger, multi-pair isolation, fill tracking, event sequencing, the
+idempotency window, the trading-pair whitelist, and market-buy orders.
 
 ```bash
 ./scripts/smoke.sh
 ```
 
-An end-to-end smoke test: brings up Redis/Postgres, runs migrations, starts
-all three binaries, then drives the real HTTP API — signup/login, an order
-that rests and one that crosses and fills, deposits, withdrawals,
-ownership-checked cancellation, account-scoped reads, the book projection
-(including a check that a resting order is visible in `GET /book` *before*
-it's matched, not just absent at the end), and the two websocket feeds —
-public book-delta delivery, the private first-message auth handshake
-(both a bad token getting closed and a good one getting authenticated),
-and that one account's private feed never sees another account's orders.
-Also covers the listed-pairs whitelist: orders on an unlisted pair are
-rejected, non-admin listing attempts are forbidden, and a pair becomes (and
-stops being) tradeable exactly when listed/delisted.
-Requires Node ≥ 22 (`scripts/ws_smoke.mjs`, invoked by `smoke.sh`, uses the
-global `WebSocket` client) in addition to Redis/Postgres/`sqlx-cli`/`jq`.
+An end-to-end test against the real running system: brings up
+Redis/Postgres, starts all three binaries, and drives the HTTP and websocket
+APIs directly — auth, matched and resting orders, deposits/withdrawals,
+ownership-checked cancellation, the book projection, both websocket feeds,
+the pair whitelist, and a market buy. Requires Node ≥ 22 in addition to
+Redis/Postgres/`sqlx-cli`/`jq`.
+
+## Performance
+
+```bash
+cargo bench
+```
+
+[`benches/engine_benchmarks.rs`](./benches/engine_benchmarks.rs) calls the
+matching engine directly — no Redis, no HTTP — to measure the algorithm on
+its own. Median of 100 samples, one dev laptop:
+
+| Operation                            | Latency | Throughput     |
+| ------------------------------------ | ------- | -------------- |
+| Deposit                              | 316 ns  | ~3.2M/s        |
+| Place a resting limit order          | 594 ns  | ~1.7M/s        |
+| Place a crossing order (1 trade)     | 1.19 µs | ~840K/s        |
+| Cancel                               | 641 ns  | ~1.6M/s        |
+| Market buy sweeping 1,000 ask levels | 278 µs  | ~3.6M levels/s |
+
+Book depth barely matters — placing an order costs about the same at 10
+resting orders or 10,000, consistent with an O(log n) price-level index. A
+market order sweeping N levels is the one case that scales with N, which is
+expected: touching N levels means N fills, N trades, N book updates.
+
+These are the engine's floor, not what a client sees end to end — every real
+request still pays a Redis round trip on top.
 
 ## Project layout
 
@@ -210,7 +167,8 @@ src/
         ├── book.rs    # in-memory order-book projection + GET /book/:pair
         └── ws.rs      # GET /ws/market/:pair (public) + GET /ws/orders (private) handlers
 
-migrations/            # sqlx migrations (users, trades, balances, orders)
-scripts/smoke.sh        # end-to-end smoke test against the real running system
-scripts/ws_smoke.mjs    # smoke.sh's websocket-feed helper (Node's global WebSocket)
+migrations/                    # sqlx migrations (users, trades, balances, orders)
+scripts/smoke.sh                # end-to-end smoke test against the real running system
+scripts/ws_smoke.mjs            # smoke.sh's websocket-feed helper (Node's global WebSocket)
+benches/engine_benchmarks.rs    # Criterion benchmarks against apply(), no transport
 ```

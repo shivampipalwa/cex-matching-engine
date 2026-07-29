@@ -244,5 +244,17 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/admin/pairs/USD-SO
   -H "Authorization: Bearer $TOK1" -H 'X-Client-Order-Id: 204')
 assert_eq "delisting an already-unlisted pair 404s" "$code" "404"
 
+echo "== 16. market buy (M8) =="
+post "$API/deposits" '{"amount":3,"currency":"SOL"}' "Authorization: Bearer $TOK2" "X-Client-Order-Id: 300" >/dev/null
+code=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Ask","price":200,"size":3}' \
+  "Authorization: Bearer $TOK2" "X-Client-Order-Id: 301" | tail -1)
+assert_eq "seller rests ask for market-buy test" "$code" "200"
+post "$API/deposits" '{"amount":600,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 302" >/dev/null
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Market","side":"Bid","price":0,"size":3}' \
+  "Authorization: Bearer $TOK1" "X-Client-Order-Id: 303")
+assert_eq "market buy accepted" "$(echo "$resp" | tail -1)" "200"
+assert_eq "market buy filled fully" "$(echo "$resp" | head -1 | jq .filled_qty)" "3"
+assert_eq "market buy charged the walked ask price" "$(echo "$resp" | head -1 | jq .total_cost)" "600"
+
 echo
 echo "ALL CHECKS PASSED"

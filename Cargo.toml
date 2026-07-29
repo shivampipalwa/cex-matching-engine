@@ -18,3 +18,10 @@ jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 argon2 = "0.5.3"
 thiserror = "2.0.19"
 async-trait = "0.1.91"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "engine_benchmarks"
+harness = false

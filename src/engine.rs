@@ -187,6 +187,29 @@ impl OrderBook {
         }
     }
 
+    // Cost to fill up to `size` off the ask side at current levels, without
+    // mutating anything. Stops early if asks run out before `size` does — the
+    // caller treats that as "reserve for what's actually fillable."
+    fn market_buy_cost(&self, size: u64) -> Result<u64, RejectReason> {
+        let mut remaining = size;
+        let mut cost: u64 = 0;
+        for (&price, level) in self.asks.iter() {
+            if remaining == 0 {
+                break;
+            }
+            let level_qty: u64 = level.iter().map(|o| o.remaining_size).sum();
+            let take = min(remaining, level_qty);
+            let level_cost = price
+                .checked_mul(take)
+                .ok_or(RejectReason::InvalidAmount)?;
+            cost = cost
+                .checked_add(level_cost)
+                .ok_or(RejectReason::InvalidAmount)?;
+            remaining -= take;
+        }
+        Ok(cost)
+    }
+
     /// Drain the dirty-level set into `(side, price, new_qty)` triples,
     /// recomputing each level's CURRENT aggregate — correct regardless of
     /// whether the level survived, shrank, or emptied out since being marked.
@@ -395,18 +418,20 @@ impl Engine {
         if !req.pair.is_valid() || !self.listed_pairs.contains(&req.pair) {
             return Err(RejectReason::InvalidPair);
         }
-        // Market buy orders not supported currently, need to implement quote price for it
-        if req.order_type == OrderType::Market && req.side == Side::Bid {
-            return Err(RejectReason::UnsupportedOrderType);
-        }
-
-        // Checked for both sides: a trade's price*qty is always bounded by
-        // either the maker's or the taker's own price*size, so rejecting any
-        // order whose own product overflows here keeps settle() safe too.
-        let quote_amount = req
-            .price
-            .checked_mul(req.size)
-            .ok_or(RejectReason::InvalidAmount)?;
+        // A market buy has no limit price to size a reserve from, but nothing
+        // else can touch the book before `add_order` below runs, so the exact
+        // cost can be walked here instead of estimated.
+        let quote_amount = if req.order_type == OrderType::Market && req.side == Side::Bid {
+            self.books
+                .get(&req.pair)
+                .map(|book| book.market_buy_cost(req.size))
+                .transpose()?
+                .unwrap_or(0)
+        } else {
+            req.price
+                .checked_mul(req.size)
+                .ok_or(RejectReason::InvalidAmount)?
+        };
 
         match req.side {
             Side::Bid => {
@@ -443,18 +468,20 @@ impl Engine {
             self.ledger.settle(req.pair, trade);
         }
 
-        // A market order's unfilled remainder never rests, so its reserve has no
-        // open commitment behind it — release it or it's stuck forever.
-        if req.order_type == OrderType::Market && match_result.taker_remaining > 0 {
-            let (currency, amount) = match req.side {
-                Side::Bid => (req.pair.quote, match_result.taker_remaining * req.price),
-                Side::Ask => (req.pair.base, match_result.taker_remaining),
-            };
-            let _ = self.ledger.release(account_id, currency, amount);
+        // A market sell's unfilled remainder never rests, so its reserve has no
+        // open commitment behind it — release it or it's stuck forever. A market
+        // buy has no equivalent: its reserve was walked to the exact fillable
+        // cost, so there's nothing left over to release.
+        if req.order_type == OrderType::Market && req.side == Side::Ask && match_result.taker_remaining > 0 {
+            let _ = self
+                .ledger
+                .release(account_id, req.pair.base, match_result.taker_remaining);
         }
 
-        // buyer surplus form reserved -> available in case of price-improved fill
-        if req.side == Side::Bid {
+        // buyer surplus from reserved -> available on a price-improved fill.
+        // Market buys have no limit price to compare against (and none is
+        // needed — their reserve is already the exact walked cost).
+        if req.side == Side::Bid && req.order_type == OrderType::Limit {
             let surplus = match_result
                 .trades
                 .iter()
@@ -1541,6 +1568,76 @@ mod ledger_tests {
             engine.ledger.withdraw(1, Currency::USD, 1),
             Err(RejectReason::InsufficientFunds)
         ));
+    }
+
+    // A market buy sweeping one ask level is charged exactly that level's
+    // price, with nothing left reserved afterward.
+    #[test]
+    fn test_market_buy_single_level() {
+        let mut engine = new_engine();
+        engine.ledger.deposit(Currency::SOL, 2, 10);
+        submit(&mut engine, 2, Side::Ask, OrderType::Limit, 100, 10).unwrap();
+        engine.ledger.deposit(Currency::USD, 1, 1000);
+
+        let res = submit(&mut engine, 1, Side::Bid, OrderType::Market, 0, 10).unwrap();
+        assert_eq!(res.trades.iter().map(|t| t.qty).sum::<u64>(), 10);
+        assert_eq!(bal(&engine, 1, Currency::USD), (0, 0));
+        assert_eq!(bal(&engine, 1, Currency::SOL), (10, 0));
+        assert_eq!(bal(&engine, 2, Currency::USD), (1000, 0));
+    }
+
+    // A market buy walks every level it needs to fill, not just the first.
+    #[test]
+    fn test_market_buy_sweeps_multiple_levels() {
+        let mut engine = new_engine();
+        engine.ledger.deposit(Currency::SOL, 2, 10);
+        submit(&mut engine, 2, Side::Ask, OrderType::Limit, 100, 5).unwrap();
+        submit(&mut engine, 2, Side::Ask, OrderType::Limit, 110, 5).unwrap();
+        engine.ledger.deposit(Currency::USD, 1, 5 * 100 + 5 * 110);
+
+        submit(&mut engine, 1, Side::Bid, OrderType::Market, 0, 10).unwrap();
+        assert_eq!(bal(&engine, 1, Currency::USD), (0, 0));
+        assert_eq!(bal(&engine, 1, Currency::SOL), (10, 0));
+    }
+
+    // The reserve is the walked cost, not a guess — insufficient funds against
+    // that exact cost is still rejected up front, same as a limit order.
+    #[test]
+    fn test_market_buy_insufficient_funds_rejected() {
+        let mut engine = new_engine();
+        engine.ledger.deposit(Currency::SOL, 2, 10);
+        submit(&mut engine, 2, Side::Ask, OrderType::Limit, 100, 10).unwrap();
+        engine.ledger.deposit(Currency::USD, 1, 999); // one short of 1000
+
+        let res = submit(&mut engine, 1, Side::Bid, OrderType::Market, 0, 10);
+        assert!(matches!(res, Err(RejectReason::InsufficientFunds)));
+        assert_eq!(bal(&engine, 1, Currency::USD), (999, 0));
+    }
+
+    // Asking for more than the book can supply fills what's there and leaves
+    // nothing reserved for the unfillable remainder — unlike a market sell,
+    // there was never a reserve taken out for it in the first place.
+    #[test]
+    fn test_market_buy_partial_fill_no_stuck_reserve() {
+        let mut engine = new_engine();
+        engine.ledger.deposit(Currency::SOL, 2, 5);
+        submit(&mut engine, 2, Side::Ask, OrderType::Limit, 100, 5).unwrap();
+        engine.ledger.deposit(Currency::USD, 1, 500);
+
+        let res = submit(&mut engine, 1, Side::Bid, OrderType::Market, 0, 10).unwrap();
+        assert_eq!(res.taker_remaining, 5);
+        assert_eq!(find_update(&res, res.order_id).status, OrderStatus::Cancelled);
+        assert_eq!(bal(&engine, 1, Currency::USD), (0, 0));
+        assert_eq!(bal(&engine, 1, Currency::SOL), (5, 0));
+    }
+
+    // An empty book fills nothing and moves no funds — not an error.
+    #[test]
+    fn test_market_buy_empty_book() {
+        let mut engine = new_engine();
+        let res = submit(&mut engine, 1, Side::Bid, OrderType::Market, 0, 10).unwrap();
+        assert!(res.trades.is_empty());
+        assert_eq!(bal(&engine, 1, Currency::USD), (0, 0));
     }
 
     // Conservation: a trade moves money but never creates or destroys it.
