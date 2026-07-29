@@ -99,6 +99,8 @@ pub enum Command {
     Cancel(CancelRequest),
     Deposit(DepositRequest),
     Withdraw(WithdrawRequest),
+    ListPair(Pair),
+    DelistPair(Pair),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,6 +149,10 @@ pub enum CommandResponse {
     Cancel(bool),
     Deposit(u64),
     Withdraw(Result<(), RejectReason>),
+    // true = newly listed, false = was already listed (still success).
+    ListPair(Result<bool, RejectReason>),
+    // true = was listed and is now removed, false = wasn't listed.
+    DelistPair(bool),
     Duplicate,
 }
 
@@ -240,6 +246,9 @@ pub struct Engine {
     pub next_seq: u64,
     pub ledger: Ledger,
     pub dedup: Dedup,
+    /// Markets open for trading. `place_order` rejects any pair not in here —
+    /// listing is itself a command, so this is replayable state like everything else.
+    pub listed_pairs: HashSet<Pair>,
 }
 
 impl Engine {
@@ -257,6 +266,7 @@ impl Engine {
                 seen: HashSet::new(),
                 order: HashMap::new(),
             },
+            listed_pairs: HashSet::new(),
         }
     }
 }

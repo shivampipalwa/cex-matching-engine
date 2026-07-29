@@ -140,6 +140,8 @@ pub fn verify_password(pw: &str, hash: &str) -> Result<bool, AuthError> {
 pub(crate) enum ApiError {
     #[error("unauthorized")]
     Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
     #[error("email already registered")]
     EmailTaken,
     #[error("bad request: {0}")]
@@ -158,6 +160,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::Forbidden => StatusCode::FORBIDDEN,
             ApiError::EmailTaken => StatusCode::CONFLICT,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::NotFound => StatusCode::NOT_FOUND,

@@ -73,6 +73,9 @@ struct AppState {
     /// `Clone`; each websocket connection calls `.subscribe()` for its own
     /// `Receiver`. See `ws.rs`.
     event_tx: broadcast::Sender<Arc<EventBatch>>,
+    /// The only account allowed to list/delist trading pairs. Env-configured
+    /// rather than a real roles system — there's exactly one admin action.
+    admin_account_id: AccountId,
 }
 
 /// Request body for `POST /orders`. Carries intent and the client-supplied idempotency key.
@@ -135,6 +138,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
     let pg_pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    let admin_account_id: AccountId = std::env::var("ADMIN_ACCOUNT_ID")?.parse()?;
     let keys = Keys {
         encoding_key: EncodingKey::from_secret(&std::env::var("JWT_SECRET")?.as_bytes()),
         decoding_key: DecodingKey::from_secret(&std::env::var("JWT_SECRET")?.as_bytes()),
@@ -167,6 +171,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         keys: Arc::new(keys),
         book_store,
         event_tx,
+        admin_account_id,
     };
     let app = Router::new()
         .route("/auth/signup", post(auth::signup))
@@ -179,6 +184,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/book/:pair", get(book::get_book))
         .route("/ws/market/:pair", get(ws::public_market))
         .route("/ws/orders", get(ws::private_orders))
+        .route("/admin/pairs", post(list_pair))
+        .route("/admin/pairs/:pair", delete(delist_pair))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
@@ -265,6 +272,10 @@ fn response_for(resp: CommandResponse) -> Response {
         }
         CommandResponse::Withdraw(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         CommandResponse::Withdraw(Err(e)) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
+        CommandResponse::ListPair(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
+        CommandResponse::ListPair(Err(e)) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
+        CommandResponse::DelistPair(true) => StatusCode::NO_CONTENT.into_response(),
+        CommandResponse::DelistPair(false) => ApiError::NotFound.into_response(),
         CommandResponse::Duplicate => StatusCode::CONFLICT.into_response(),
     }
 }
@@ -343,6 +354,56 @@ async fn withdraw(
         amount: body.amount,
         currency: body.currency,
     });
+    match submit_command(&mut state, account_id, client_order_id, command).await {
+        Ok(resp) => response_for(resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+fn require_admin(state: &AppState, account_id: AccountId) -> Result<(), ApiError> {
+    if account_id != state.admin_account_id {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ListPairBody {
+    pair: Pair,
+}
+
+/// `POST /admin/pairs` — admin only. Opens a market for trading.
+async fn list_pair(
+    State(mut state): State<AppState>,
+    AuthUser(account_id): AuthUser,
+    ClientOrderId(client_order_id): ClientOrderId,
+    Json(body): Json<ListPairBody>,
+) -> Response {
+    if let Err(e) = require_admin(&state, account_id) {
+        return e.into_response();
+    }
+    let command = Command::ListPair(body.pair);
+    match submit_command(&mut state, account_id, client_order_id, command).await {
+        Ok(resp) => response_for(resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `DELETE /admin/pairs/:pair` — admin only. Closes a market to new orders.
+async fn delist_pair(
+    State(mut state): State<AppState>,
+    AuthUser(account_id): AuthUser,
+    ClientOrderId(client_order_id): ClientOrderId,
+    Path(raw_pair): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&state, account_id) {
+        return e.into_response();
+    }
+    let pair = match Pair::try_from(raw_pair) {
+        Ok(p) => p,
+        Err(_) => return ApiError::BadRequest("invalid pair, expected BASE-QUOTE").into_response(),
+    };
+    let command = Command::DelistPair(pair);
     match submit_command(&mut state, account_id, client_order_id, command).await {
         Ok(resp) => response_for(resp),
         Err(e) => e.into_response(),

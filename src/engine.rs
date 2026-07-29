@@ -392,7 +392,7 @@ impl Engine {
         account_id: AccountId,
         req: &OrderRequest,
     ) -> Result<MatchResponse, RejectReason> {
-        if !req.pair.is_valid() {
+        if !req.pair.is_valid() || !self.listed_pairs.contains(&req.pair) {
             return Err(RejectReason::InvalidPair);
         }
         // Market buy orders not supported currently, need to implement quote price for it
@@ -589,6 +589,14 @@ pub fn apply(
                 .withdraw(account_id, withdraw_request.currency, withdraw_request.amount);
             CommandResponse::Withdraw(res)
         }
+        Command::ListPair(pair) => {
+            if !pair.is_valid() {
+                CommandResponse::ListPair(Err(RejectReason::InvalidPair))
+            } else {
+                CommandResponse::ListPair(Ok(engine.listed_pairs.insert(pair)))
+            }
+        }
+        Command::DelistPair(pair) => CommandResponse::DelistPair(engine.listed_pairs.remove(&pair)),
     };
     for (account_id, currency) in engine.ledger.take_dirty() {
         let b = &engine.ledger.balances[&account_id][&currency];
@@ -811,7 +819,9 @@ mod test_util {
     /// A fresh `Engine` (no books + empty ledger) for the ledger/settlement
     /// tests that need the full reserve → match → settle path.
     pub fn new_engine() -> Engine {
-        Engine::new()
+        let mut engine = Engine::new();
+        engine.listed_pairs.insert(TEST_PAIR);
+        engine
     }
 
     /// Places an order and returns the full `MatchResponse` (order id + trades).
@@ -1318,6 +1328,7 @@ mod ledger_tests {
     fn test_orders_in_different_pairs_do_not_match() {
         let mut engine = new_engine();
         let other = Pair::new(Currency::USD, Currency::SOL); // a different market
+        engine.listed_pairs.insert(other);
 
         engine.ledger.deposit(Currency::SOL, 2, 10);
         submit_pair(
@@ -1347,6 +1358,7 @@ mod ledger_tests {
     fn test_order_ids_unique_across_pairs() {
         let mut engine = new_engine();
         let other = Pair::new(Currency::USD, Currency::SOL);
+        engine.listed_pairs.insert(other);
 
         // An Ask reserves the pair's base: SOL for SOL-USD, USD for USD-SOL.
         engine.ledger.deposit(Currency::SOL, 1, 100);
@@ -1372,6 +1384,7 @@ mod ledger_tests {
     fn test_cancel_routes_to_correct_pair() {
         let mut engine = new_engine();
         let other = Pair::new(Currency::USD, Currency::SOL);
+        engine.listed_pairs.insert(other);
 
         // Rest a bid in `other`, which reserves its quote (SOL).
         engine.ledger.deposit(Currency::SOL, 1, 1000);
@@ -1601,6 +1614,9 @@ mod apply_tests {
     #[test]
     fn test_resting_order_gets_one_batch() {
         let mut engine = Engine::new();
+        engine
+            .listed_pairs
+            .insert(Pair::new(Currency::SOL, Currency::USD));
         apply(&mut engine, 1, 1, deposit_cmd_currency(10, Currency::SOL));
 
         let place = Command::Place(OrderRequest {
@@ -1650,6 +1666,9 @@ mod apply_tests {
     #[test]
     fn test_crossing_order_batches_accept_trade_and_both_updates_together() {
         let mut engine = Engine::new();
+        engine
+            .listed_pairs
+            .insert(Pair::new(Currency::SOL, Currency::USD));
         apply(&mut engine, 2, 1, deposit_cmd_currency(10, Currency::SOL));
         let ask = Command::Place(OrderRequest {
             pair: Pair::new(Currency::SOL, Currency::USD),
@@ -1681,6 +1700,100 @@ mod apply_tests {
             .filter(|e| matches!(e, Event::OrderUpdated { .. }))
             .count();
         assert_eq!(updates, 2);
+    }
+}
+
+#[cfg(test)]
+mod pair_whitelist_tests {
+    use super::*;
+
+    fn place_cmd(pair: Pair) -> Command {
+        Command::Place(OrderRequest {
+            pair,
+            order_type: OrderType::Limit,
+            side: Side::Ask,
+            price: 100,
+            size: 1,
+        })
+    }
+
+    // Any pair is unlisted until an explicit ListPair command — the whitelist
+    // starts empty, not open-by-default.
+    #[test]
+    fn test_unlisted_pair_rejected() {
+        let mut engine = Engine::new();
+        let pair = Pair::new(Currency::SOL, Currency::USD);
+        engine.ledger.deposit(Currency::SOL, 1, 1);
+        let res = engine.place_order(1, &OrderRequest {
+            pair,
+            order_type: OrderType::Limit,
+            side: Side::Ask,
+            price: 100,
+            size: 1,
+        });
+        assert!(matches!(res, Err(RejectReason::InvalidPair)));
+    }
+
+    // ListPair then Place: the pair becomes tradeable.
+    #[test]
+    fn test_listed_pair_accepted() {
+        let mut engine = Engine::new();
+        let pair = Pair::new(Currency::SOL, Currency::USD);
+        let (resp, _) = apply(&mut engine, 1, 1, Command::ListPair(pair));
+        assert!(matches!(resp, CommandResponse::ListPair(Ok(true))));
+
+        engine.ledger.deposit(Currency::SOL, 1, 1);
+        let (resp, _) = apply(&mut engine, 1, 2, place_cmd(pair));
+        assert!(matches!(resp, CommandResponse::Place(Ok(_))));
+    }
+
+    // Listing an already-listed pair is a no-op success, not an error.
+    #[test]
+    fn test_relisting_is_idempotent() {
+        let mut engine = Engine::new();
+        let pair = Pair::new(Currency::SOL, Currency::USD);
+        apply(&mut engine, 1, 1, Command::ListPair(pair));
+        let (resp, _) = apply(&mut engine, 1, 2, Command::ListPair(pair));
+        assert!(matches!(resp, CommandResponse::ListPair(Ok(false))));
+    }
+
+    // base == quote is rejected even as an admin action, not just at order time.
+    #[test]
+    fn test_listing_invalid_pair_rejected() {
+        let mut engine = Engine::new();
+        let bad = Pair::new(Currency::SOL, Currency::SOL);
+        let (resp, _) = apply(&mut engine, 1, 1, Command::ListPair(bad));
+        assert!(matches!(
+            resp,
+            CommandResponse::ListPair(Err(RejectReason::InvalidPair))
+        ));
+    }
+
+    // DelistPair closes a market back down to new orders.
+    #[test]
+    fn test_delisted_pair_rejected_again() {
+        let mut engine = Engine::new();
+        let pair = Pair::new(Currency::SOL, Currency::USD);
+        apply(&mut engine, 1, 1, Command::ListPair(pair));
+
+        let (resp, _) = apply(&mut engine, 1, 2, Command::DelistPair(pair));
+        assert!(matches!(resp, CommandResponse::DelistPair(true)));
+
+        engine.ledger.deposit(Currency::SOL, 1, 1);
+        let (resp, _) = apply(&mut engine, 1, 3, place_cmd(pair));
+        assert!(matches!(
+            resp,
+            CommandResponse::Place(Err(RejectReason::InvalidPair))
+        ));
+    }
+
+    // Delisting a pair that was never listed is reported, not treated as an error.
+    #[test]
+    fn test_delisting_unlisted_pair_reports_false() {
+        let mut engine = Engine::new();
+        let pair = Pair::new(Currency::SOL, Currency::USD);
+        let (resp, _) = apply(&mut engine, 1, 1, Command::DelistPair(pair));
+        assert!(matches!(resp, CommandResponse::DelistPair(false)));
     }
 }
 

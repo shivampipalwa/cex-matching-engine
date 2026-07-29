@@ -52,7 +52,14 @@ Actively being built, milestone by milestone. Currently:
     (`OrderAccepted`/`OrderUpdated`). No `Authorization` header on a
     websocket upgrade (browsers can't set one), so auth is a first-message
     handshake: the client's first frame must be `{"token": "<jwt>"}`
-- ⬜ Latency benchmarks, observability, one-engine-per-pair horizontal scaling
+- ✅ Listed-pairs whitelist — no pair is tradeable until an admin lists it via
+  `POST /admin/pairs`/`DELETE /admin/pairs/:pair`, gated by the
+  `ADMIN_ACCOUNT_ID` env var (not a full roles system — there's one admin
+  action). Also: a bounded idempotency-key set (no longer unbounded memory
+  growth), and an overflow guard on order value (`price * size`) checked once
+  at placement rather than left to wrap around silently later.
+- ⬜ Market-buy orders, latency benchmarks, observability,
+  one-engine-per-pair horizontal scaling
 
 ## Architecture at a glance
 
@@ -102,6 +109,7 @@ A `.env` in the repo root with:
 ```
 DATABASE_URL=postgres://postgres:pw@127.0.0.1:5432/exchange
 JWT_SECRET=<any string>
+ADMIN_ACCOUNT_ID=<account id allowed to list/delist trading pairs>
 ```
 
 Run migrations, then each process in its own terminal:
@@ -120,8 +128,14 @@ curl -X POST localhost:3000/auth/signup -H 'content-type: application/json' \
   -d '{"email":"me@x.com","password":"pw"}'
 # -> {"token": "..."}
 
+# No pair is tradeable until listed — use the account whose id matches
+# ADMIN_ACCOUNT_ID (e.g. the first signup, id 1, on a fresh DB).
+curl -X POST localhost:3000/admin/pairs \
+  -H "Authorization: Bearer <admin token>" -H 'X-Client-Order-Id: 1' \
+  -H 'content-type: application/json' -d '{"pair":"SOL-USD"}'
+
 curl -X POST localhost:3000/orders \
-  -H "Authorization: Bearer <token>" -H 'X-Client-Order-Id: 1' \
+  -H "Authorization: Bearer <token>" -H 'X-Client-Order-Id: 2' \
   -H 'content-type: application/json' \
   -d '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":100,"size":10}'
 
@@ -150,11 +164,14 @@ docker exec -it redis redis-cli
 cargo test
 ```
 
-43 unit tests: order book matching (fills, partial fills, FIFO, market
+52 unit tests: order book matching (fills, partial fills, FIFO, market
 sweeps), cancellation and ownership, trade pricing, the ledger
-(reserve/settle/refund/release, insufficient-funds rejection, conservation),
-multi-pair isolation, fill-tracking/status transitions, and the event-batch
-sequencing (seq assignment, no-seq-for-no-op commands, book-delta dedup).
+(reserve/settle/refund/release, insufficient-funds rejection, conservation,
+overflow rejection, multi-currency withdraw), multi-pair isolation,
+fill-tracking/status transitions, the event-batch sequencing (seq assignment,
+no-seq-for-no-op commands, book-delta dedup), the bounded dedup window, and
+the listed-pairs whitelist (list/delist, idempotent re-listing, rejection
+before listing and after delisting).
 
 ```bash
 ./scripts/smoke.sh
@@ -169,6 +186,9 @@ it's matched, not just absent at the end), and the two websocket feeds —
 public book-delta delivery, the private first-message auth handshake
 (both a bad token getting closed and a good one getting authenticated),
 and that one account's private feed never sees another account's orders.
+Also covers the listed-pairs whitelist: orders on an unlisted pair are
+rejected, non-admin listing attempts are forbidden, and a pair becomes (and
+stops being) tradeable exactly when listed/delisted.
 Requires Node ≥ 22 (`scripts/ws_smoke.mjs`, invoked by `smoke.sh`, uses the
 global `WebSocket` client) in addition to Redis/Postgres/`sqlx-cli`/`jq`.
 

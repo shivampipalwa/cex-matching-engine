@@ -14,6 +14,9 @@ cd "$ROOT"
 
 # Load DATABASE_URL / JWT_SECRET for sqlx + the api process.
 set -a; source .env; set +a
+# RESTART IDENTITY (step 3) always makes the first signup account id 1 — that's
+# the buyer below, so it's also the admin for this run's whitelist checks.
+export ADMIN_ACCOUNT_ID=1
 
 PIDS=()
 cleanup() { [[ ${#PIDS[@]} -gt 0 ]] && kill "${PIDS[@]}" 2>/dev/null || true; }
@@ -74,13 +77,25 @@ TOK2=$(post "$API/auth/signup" '{"email":"seller@x.com","password":"pw2"}' | hea
 code=$(post "$API/auth/login" '{"email":"buyer@x.com","password":"wrong"}' | tail -1)
 assert_eq "bad login rejected" "$code" "401"
 
-echo "== 6. seed balances (XADD; no deposit endpoint yet) =="
+echo "== 6. pairs (admin whitelist, M8) =="
+# unlisted -> rejected, even for a funded account with a valid pair shape
+code=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Ask","price":100,"size":1}' \
+  "Authorization: Bearer $TOK1" "X-Client-Order-Id: 100" | tail -1)
+assert_eq "unlisted pair rejected" "$code" "400"
+# non-admin cannot list
+code=$(post "$API/admin/pairs" '{"pair":"SOL-USD"}' "Authorization: Bearer $TOK2" "X-Client-Order-Id: 101" | tail -1)
+assert_eq "non-admin cannot list a pair" "$code" "403"
+# admin lists it
+code=$(post "$API/admin/pairs" '{"pair":"SOL-USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 102" | tail -1)
+assert_eq "admin lists SOL-USD" "$code" "204"
+
+echo "== 7. seed balances (XADD; no deposit endpoint yet) =="
 redis XADD commands '*' data '{"correlation_id":"00000000-0000-0000-0000-000000000000","account_id":1,"client_order_id":900,"command":{"Deposit":{"amount":1000,"currency":"USD"}}}' >/dev/null
 redis XADD commands '*' data '{"correlation_id":"00000000-0000-0000-0000-000000000000","account_id":2,"client_order_id":901,"command":{"Deposit":{"amount":10,"currency":"SOL"}}}' >/dev/null
 sleep 0.5
 pass "deposits seeded (acct1 1000 USD, acct2 10 SOL)"
 
-echo "== 7. orders (identity from the JWT) =="
+echo "== 8. orders (identity from the JWT) =="
 # seller (acct 2) rests an ask
 resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Ask","price":100,"size":10}' "Authorization: Bearer $TOK2" "X-Client-Order-Id: 1")
 assert_eq "ask accepted"     "$(echo "$resp" | tail -1)" "200"
@@ -104,7 +119,7 @@ assert_eq "order without X-Client-Order-Id rejected" "$code" "400"
 code=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":100,"size":10}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 2" | tail -1)
 assert_eq "duplicate client_order_id rejected" "$code" "409"
 
-echo "== 8. deposits / withdrawals =="
+echo "== 9. deposits / withdrawals =="
 code=$(post "$API/deposits" '{"amount":50,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 10" | tail -1)
 assert_eq "deposit accepted" "$code" "200"
 code=$(post "$API/withdrawals" '{"amount":20,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 11" | tail -1)
@@ -120,7 +135,7 @@ assert_eq "SOL deposit accepted" "$code" "200"
 code=$(post "$API/withdrawals" '{"amount":3,"currency":"SOL"}' "Authorization: Bearer $TOK2" "X-Client-Order-Id: 14" | tail -1)
 assert_eq "non-USD withdrawal accepted" "$code" "204"
 
-echo "== 9. cancel (ownership enforced by the engine) =="
+echo "== 10. cancel (ownership enforced by the engine) =="
 # buyer rests a bid that won't cross
 resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":1,"size":5}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 20")
 OID=$(echo "$resp" | head -1 | jq -r .order_id)
@@ -138,7 +153,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/orders/999999" \
   -H "Authorization: Bearer $TOK1" -H 'X-Client-Order-Id: 23')
 assert_eq "cancel of unknown order 404s" "$code" "404"
 
-echo "== 10. reads (account-scoped, off the projection) =="
+echo "== 11. reads (account-scoped, off the projection) =="
 sleep 0.5
 bal1=$(curl -s "$API/balances" -H "Authorization: Bearer $TOK1")
 assert_eq "buyer sees own SOL balance" "$(echo "$bal1" | jq -r '.[] | select(.currency=="SOL") | .available')" "10"
@@ -151,7 +166,7 @@ assert_eq "seller sees only own orders" "$(echo "$ord2" | jq 'length')" "1"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$API/balances")
 assert_eq "reads require auth" "$code" "401"
 
-echo "== 11. verify projection =="
+echo "== 12. verify projection =="
 sleep 0.5
 assert_eq "one trade recorded"  "$(psql 'select count(*) from trades')" "1"
 assert_eq "trade price"         "$(psql 'select price from trades')"    "100"
@@ -163,7 +178,7 @@ assert_eq "both orders filled"   "$(psql "select count(*) from orders where stat
 assert_eq "no orders left open"  "$(psql "select count(*) from orders where status='open'")"   "0"
 assert_eq "filled_qty recorded"  "$(psql "select distinct filled_qty from orders where status='filled'")" "10"
 
-echo "== 12. book projection (in-memory, public market data) =="
+echo "== 13. book projection (in-memory, public market data) =="
 sleep 1  # let the live tail catch up on the cancel from step 9
 book=$(curl -s "$API/book/SOL-USD")
 assert_eq "book snapshot has a sequence field" "$(echo "$book" | jq 'has("sequence")')" "true"
@@ -180,7 +195,7 @@ assert_eq "untraded pair has empty bids" "$(echo "$untraded" | head -1 | jq '.bi
 code=$(curl -s -o /dev/null -w '%{http_code}' "$API/book/SOL-USD")
 assert_eq "book endpoint requires no auth" "$code" "200"
 
-echo "== 13. websocket feeds (M7: public market data + private order updates) =="
+echo "== 14. websocket feeds (M7: public market data + private order updates) =="
 node scripts/ws_smoke.mjs "$API" "SOL-USD" "$TOK1" "$TOK2" "not-a-real-jwt" \
   >/tmp/smoke_ws.json 2>/tmp/smoke_ws.log &
 WSPID=$!
@@ -207,6 +222,27 @@ assert_eq "buyer's private feed saw OrderAccepted" \
 # privacy: the seller's own private connection must never see the buyer's order.
 assert_eq "seller's private feed did NOT see buyer's order" \
   "$(jq '[.orders2[] | select(.OrderAccepted.price==50)] | length' /tmp/smoke_ws.json)" "0"
+
+echo "== 15. pair delisting (M8) =="
+# USD-SOL was never traded (only checked as an empty book in step 13), so it's
+# free to use here without touching any of the SOL-USD state above. Orders use
+# a deliberately huge size so they're rejected for InsufficientFunds — proving
+# they got PAST the whitelist check — regardless of buyer's exact balance by
+# this point in the script.
+code=$(post "$API/admin/pairs" '{"pair":"USD-SOL"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 200" | tail -1)
+assert_eq "admin lists USD-SOL" "$code" "204"
+resp=$(post "$API/orders" '{"pair":"USD-SOL","order_type":"Limit","side":"Ask","price":1,"size":999999999}' \
+  "Authorization: Bearer $TOK1" "X-Client-Order-Id: 201")
+assert_eq "USD-SOL tradeable once listed" "$(echo "$resp" | head -1 | jq -r .)" "InsufficientFunds"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/admin/pairs/USD-SOL" \
+  -H "Authorization: Bearer $TOK1" -H 'X-Client-Order-Id: 202')
+assert_eq "admin delists USD-SOL" "$code" "204"
+resp=$(post "$API/orders" '{"pair":"USD-SOL","order_type":"Limit","side":"Ask","price":1,"size":999999999}' \
+  "Authorization: Bearer $TOK1" "X-Client-Order-Id: 203")
+assert_eq "USD-SOL rejected again after delisting" "$(echo "$resp" | head -1 | jq -r .)" "InvalidPair"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/admin/pairs/USD-SOL" \
+  -H "Authorization: Bearer $TOK1" -H 'X-Client-Order-Id: 204')
+assert_eq "delisting an already-unlisted pair 404s" "$code" "404"
 
 echo
 echo "ALL CHECKS PASSED"
