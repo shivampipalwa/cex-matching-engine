@@ -4,7 +4,7 @@ mod ws;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -34,6 +34,7 @@ use tokio::{
     sync::{broadcast, oneshot},
     time::timeout,
 };
+use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::auth::{ApiError, AuthUser, ClientOrderId};
@@ -47,6 +48,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// this many batches behind gets `Lagged` and is disconnected (see `ws.rs`)
 /// rather than the channel growing unbounded.
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
+
+const DEFAULT_CANDLES_LIMIT: i64 = 200;
+const MAX_CANDLES_LIMIT: i64 = 1000;
 
 /// Correlation-id → one-shot waiting handler. The shared subscriber removes
 /// an entry and fires its sender when the matching replies with the `results`.
@@ -120,6 +124,36 @@ struct OrderRow {
     status: String,
 }
 
+#[derive(Deserialize)]
+struct CandlesQuery {
+    interval: String,
+    start: Option<i64>,
+    end: Option<i64>,
+    limit: Option<i64>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct CandleRow {
+    time: i64,
+    open: i64,
+    high: i64,
+    low: i64,
+    close: i64,
+    volume: i64,
+}
+
+fn interval_seconds(interval: &str) -> Option<i64> {
+    Some(match interval {
+        "1s" => 1,
+        "15m" => 900,
+        "1h" => 3600,
+        "4h" => 14400,
+        "1d" => 86400,
+        "1w" => 604800,
+        _ => return None,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
@@ -182,6 +216,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/withdrawals", post(withdraw))
         .route("/balances", get(get_balances))
         .route("/book/:pair", get(book::get_book))
+        .route("/candles/:pair", get(get_candles))
         .route("/ws/market/:pair", get(ws::public_market))
         .route("/ws/orders", get(ws::private_orders))
         .route("/admin/pairs", post(list_pair))
@@ -439,6 +474,50 @@ async fn get_orders(
            FROM orders WHERE account_id = $1 ORDER BY order_id DESC",
     )
     .bind(account_id as i64)
+    .fetch_all(&state.pg_pool)
+    .await?;
+    Ok(Json(rows))
+}
+
+/// `GET /candles/:pair`
+async fn get_candles(
+    State(state): State<AppState>,
+    Path(raw_pair): Path<String>,
+    Query(q): Query<CandlesQuery>,
+) -> Result<Json<Vec<CandleRow>>, ApiError> {
+    let pair = Pair::try_from(raw_pair)
+        .map_err(|_| ApiError::BadRequest("invalid pair, expected BASE-QUOTE"))?;
+    let seconds = interval_seconds(&q.interval).ok_or(ApiError::BadRequest(
+        "invalid interval, expected one of 1s/15m/1h/4h/1d/1w",
+    ))?;
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_CANDLES_LIMIT)
+        .clamp(1, MAX_CANDLES_LIMIT);
+
+    let rows = sqlx::query_as::<_, CandleRow>(
+        "SELECT bucket AS time, open, high, low, close, volume FROM (
+            SELECT
+                (floor(extract(epoch FROM created_at) / $2::double precision) * $2::double precision)::bigint AS bucket,
+                (array_agg(price ORDER BY created_at ASC))[1]::bigint AS open,
+                max(price)::bigint AS high,
+                min(price)::bigint AS low,
+                (array_agg(price ORDER BY created_at DESC))[1]::bigint AS close,
+                sum(qty)::bigint AS volume
+            FROM trades
+            WHERE pair = $1
+              AND ($3::bigint IS NULL OR extract(epoch FROM created_at) >= $3)
+              AND ($4::bigint IS NULL OR extract(epoch FROM created_at) < $4)
+            GROUP BY 1
+            ORDER BY bucket DESC
+            LIMIT $5
+        ) sub ORDER BY bucket ASC",
+    )
+    .bind(pair.to_string())
+    .bind(seconds)
+    .bind(q.start)
+    .bind(q.end)
+    .bind(limit)
     .fetch_all(&state.pg_pool)
     .await?;
     Ok(Json(rows))

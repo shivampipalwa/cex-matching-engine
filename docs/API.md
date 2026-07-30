@@ -228,6 +228,50 @@ A syntactically valid but never-traded pair returns `200` with empty sides.
 
 ---
 
+### `GET /candles/:pair`
+
+Public, no auth. OHLCV candlesticks, aggregated on read from trade history —
+this is what you'd feed a charting library (TradingView's `lightweight-charts`
+accepts this shape close to as-is).
+
+Query:
+
+| Param | Required | Meaning |
+|---|---|---|
+| `interval` | yes | One of `1s`, `15m`, `1h`, `4h`, `1d`, `1w` — anything else is `400` |
+| `start` | no | Unix seconds, inclusive. Omit for "most recent" |
+| `end` | no | Unix seconds, exclusive |
+| `limit` | no | Default `200`, clamped to `1000` |
+
+**`200`** →
+```json
+[
+  { "time": 1785361871, "open": 100, "high": 110, "low": 100, "close": 110, "volume": 2 },
+  { "time": 1785361873, "open": 90,  "high": 90,  "low": 90,  "close": 90,  "volume": 3 }
+]
+```
+
+Real numbers, ascending by `time`. `time` is the **start** of the bucket, in Unix
+seconds. `volume` is total base-currency quantity traded in that bucket.
+
+If neither `start` nor `end` is given, you get the most recent `limit` buckets
+that actually had a trade. A pair with no trades in range returns `[]` — same
+convention as `GET /book/:pair`'s never-traded case.
+
+⚠️ **No gap-filling.** A bucket with zero trades is simply absent, not returned
+as a flat candle at the previous close. A quiet hour shrinks the array instead of
+padding it — if your chart wants continuous candles, backfill flat ones
+client-side from the previous `close`.
+
+⚠️ **Weekly buckets don't start on Monday.** Bucketing is `floor(unix_time /
+interval_seconds)`, not calendar-aware — correct and UTC-midnight-aligned for
+every interval except `1w`, which starts on Thursday (Unix epoch was a
+Thursday). Daily, hourly, and sub-hour buckets are unaffected.
+
+**`400`** bad `interval` or malformed pair · **`422`** unknown currency in pair
+
+---
+
 ### Admin: `POST /admin/pairs` 🔒 + `X-Client-Order-Id`
 
 Only the account whose id matches the server's `ADMIN_ACCOUNT_ID`.
@@ -369,4 +413,7 @@ Real inconsistencies, listed so they don't look like frontend bugs:
 - No pagination on `GET /orders` — grows without bound.
 - No endpoint lists which pairs are currently tradeable; the frontend has to know
   or discover them by trial.
-- No `GET /trades` — public trade history is only available live over WebSocket.
+- No `GET /trades` for a raw trade list — `GET /candles/:pair` gives aggregated
+  history, live trades are on the WebSocket, but there's no paginated "last N
+  individual trades" endpoint.
+- `GET /candles/:pair` doesn't gap-fill empty buckets — see its section above.
