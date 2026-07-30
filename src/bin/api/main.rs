@@ -221,6 +221,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/ws/orders", get(ws::private_orders))
         .route("/admin/pairs", post(list_pair))
         .route("/admin/pairs/:pair", delete(delist_pair))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
