@@ -17,9 +17,15 @@ and a Postgres-backed trade/order history, wired together over Redis Streams.
 - In-memory order-book projection with sequence-numbered snapshots
 - Public and private websocket feeds (book/trades, per-account order updates)
 - Overflow-checked order sizing, bounded idempotency-key memory
+- Abuse guards for a public deployment — deposit ceiling, price bands,
+  self-trade prevention
+- Periodic state snapshots, so recovery and stream trimming are both bounded
+- Deployable as one `docker compose` stack, with a market maker keeping the
+  book alive
 - Benchmark suite for the matching engine (`cargo bench`)
 
-Not yet built: structured logging/metrics, one engine per trading pair.
+Not yet built: structured logging/metrics, one engine per trading pair,
+Postgres retention.
 
 ## Architecture
 
@@ -40,6 +46,26 @@ Not yet built: structured logging/metrics, one engine per trading pair.
   and for any fresh reader bootstrapping its own projection.
 - Trades settle through the ledger's available/reserved split; conservation
   (a trade moves money, never creates or destroys it) is enforced in tests.
+- Each process periodically snapshots its state alongside the stream id it's
+  current as of, then trims the stream behind it. Recovery resumes from the
+  snapshot rather than replaying from the beginning. The snapshot is always
+  written before the trim — the other order discards the history recovery
+  needs.
+
+## Abuse guards
+
+`POST /deposits` is an open faucet, which on a public URL means anyone can
+credit themselves whatever they like and flatten the book. Three guards, all
+enforced in the engine so they replay deterministically:
+
+| Guard | Rule |
+| --- | --- |
+| Deposit ceiling | Rejects a deposit that would push `available + reserved` past a per-currency ceiling. Caps the *holding*, not the request, so sending it twice doesn't help — and a visitor who loses money can still top back up. |
+| Price band | Rejects a limit order more than ±20% from the market's last traded price. Bounding balances bounds size but not placement: a one-lot bid at price 1 costs nothing and still puts a wick on the chart. |
+| Self-trade prevention | Rejects an order that would match the same account's resting order. Self-matching is the cheapest way to paint the tape. |
+
+All three are configurable via `Engine.limits`; `Limits::none()` turns them off
+so the benchmarks measure matching rather than these checks.
 
 ## Running it
 
@@ -57,6 +83,11 @@ DATABASE_URL=postgres://postgres:pw@127.0.0.1:5432/exchange
 JWT_SECRET=<any string>
 ADMIN_ACCOUNT_ID=<account id allowed to list/delist trading pairs>
 ```
+
+Optional, all with working defaults: `REDIS_URL`, `BIND_ADDR`,
+`ENGINE_SNAPSHOT_PATH` / `BOOK_SNAPSHOT_PATH` (unset means no snapshots and no
+stream trimming — the original replay-everything behaviour), and
+`ENGINE_SNAPSHOT_EVERY` / `BOOK_SNAPSHOT_EVERY`.
 
 Run migrations, then each process in its own terminal:
 
@@ -102,15 +133,44 @@ docker exec -it redis redis-cli
 
 Full endpoint and WebSocket reference: [`docs/API.md`](./docs/API.md).
 
+## Deploying
+
+One VM, one `docker compose` stack: Postgres, Redis, the three binaries, a
+one-shot migration, a market maker, and Caddy. Caddy serves the frontend and
+proxies the API under `/api` on the **same origin**, so there's no CORS and no
+mixed content — which is also why a production frontend build uses a relative
+API base.
+
+```bash
+cd deploy
+cp .env.example .env        # set SITE_ADDRESS, secrets, FRONTEND_DIST
+docker compose up -d --build
+```
+
+`SITE_ADDRESS` as a hostname gets a Let's Encrypt certificate automatically;
+use `:80` to run without TLS. `FRONTEND_DIST` points at a built frontend
+(`npm run build`), mounted read-only.
+
+The `bot` service runs two fixed accounts — a maker resting quotes on both
+sides, and a taker crossing into them — so the book and the trade tape stay
+alive between visitors. Splitting the roles is what keeps it clear of the
+self-trade guard. It drives the same public HTTP API as any other client.
+
+On a fresh database, whichever account signs up first becomes account 1 and
+therefore the admin. That's normally the bot, which is how the market gets
+listed at all. Sign up yourself first if you want to be the admin.
+
 ## Tests
 
 ```bash
 cargo test
 ```
 
-57 unit tests covering order-book matching, cancellation, trade pricing, the
+85 unit tests covering order-book matching, cancellation, trade pricing, the
 ledger, multi-pair isolation, fill tracking, event sequencing, the
-idempotency window, the trading-pair whitelist, and market-buy orders.
+idempotency window, the trading-pair whitelist, market-buy orders, the abuse
+guards, and snapshot round-tripping — including that resuming from a snapshot
+lands in exactly the state a full replay would have.
 
 ```bash
 ./scripts/smoke.sh
@@ -154,13 +214,16 @@ request still pays a Redis round trip on top.
 ```
 src/
 ├── types.rs         # wire + domain types: Order, Trade, Pair, Command/CommandResponse,
-│                     # Event/EventBatch, Engine/OrderBook, Ledger
+│                     # Event/EventBatch, Engine/OrderBook, Ledger, Limits
 ├── engine.rs         # OrderBook (matching), Ledger, Engine (orchestration), apply(),
 │                     # run_engine()/recover() (Redis loop + crash recovery), tests
+├── snapshot.rs       # save/load anchored to a stream id, XTRIM helpers
 ├── lib.rs
 └── bin/
     ├── engine.rs      # engine process: consumes `commands`, emits `events`
     ├── db_writer.rs   # projects `events` into Postgres (trades/balances/orders)
+    ├── migrate.rs     # one-shot migration runner, so api/db_writer never race
+    ├── bot.rs         # market maker: maker + taker accounts over the public API
     └── api/
         ├── main.rs    # HTTP server: AppState, the correlation-flow helper, all handlers
         ├── auth.rs    # JWT sign/verify, argon2 hashing, AuthUser/ClientOrderId extractors
@@ -168,7 +231,11 @@ src/
         └── ws.rs      # GET /ws/market/:pair (public) + GET /ws/orders (private) handlers
 
 migrations/                    # sqlx migrations (users, trades, balances, orders)
+deploy/docker-compose.yml       # the full stack: infra, three processes, bot, caddy
+deploy/Caddyfile                # TLS, SPA, and /api on one origin
+Dockerfile                      # multi-stage build, all binaries in one image
 scripts/smoke.sh                # end-to-end smoke test against the real running system
 scripts/ws_smoke.mjs            # smoke.sh's websocket-feed helper (Node's global WebSocket)
+scripts/seed.sh                 # one-off historical fill, for a chart with some past
 benches/engine_benchmarks.rs    # Criterion benchmarks against apply(), no transport
 ```
