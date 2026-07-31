@@ -4,6 +4,7 @@ use crate::types::{
     OrderLocation, OrderRequest, OrderStatus, OrderType, OrderUpdate, Pair, PlaceOrderResponse,
     RejectReason, ResponseEnvelope, Side, Trade,
 };
+use crate::snapshot::{self, SnapshotConfig};
 use redis::{AsyncCommands, aio::MultiplexedConnection, streams::StreamRangeReply};
 use std::{cmp::min, collections::VecDeque, error::Error};
 
@@ -733,9 +734,25 @@ pub fn apply(
 pub async fn recover(
     engine: &mut Engine,
     conn: &mut MultiplexedConnection,
+    snapshot: Option<&SnapshotConfig>,
 ) -> Result<(), Box<dyn Error>> {
     println!("Starting Recovery");
-    let reply: StreamRangeReply = conn.xrange("commands", "-", "+").await?;
+
+    // `(id` is an exclusive start, so the anchor entry isn't applied twice.
+    let from = match snapshot.and_then(|s| snapshot::load::<Engine>(&s.path)) {
+        Some(snap) => {
+            println!("Restored snapshot at {}", snap.last_id);
+            let last_id = snap.last_id;
+            // limits are this process's config, not the snapshot's
+            let limits = engine.limits;
+            *engine = snap.state;
+            engine.limits = limits;
+            format!("({last_id}")
+        }
+        None => "-".to_string(),
+    };
+
+    let reply: StreamRangeReply = conn.xrange("commands", from, "+").await?;
     let mut last_id = None;
     for id in reply.ids {
         // get command data
@@ -782,12 +799,14 @@ pub async fn run_engine(
     mut engine: Engine,
     mut read_conn: MultiplexedConnection,
     mut pub_conn: MultiplexedConnection,
+    snapshot: Option<SnapshotConfig>,
 ) -> Result<(), Box<dyn Error>> {
-    recover(&mut engine, &mut pub_conn).await?;
+    recover(&mut engine, &mut pub_conn, snapshot.as_ref()).await?;
     let opts = StreamReadOptions::default()
         .group("engine-group", "engine-1")
         .block(5000)
         .count(10);
+    let mut since_snapshot = 0u64;
     loop {
         let reply: StreamReadReply = read_conn
             .xread_options(&["commands"], &[">"], &opts)
@@ -873,8 +892,21 @@ pub async fn run_engine(
 
                 // ACK command
                 let _: i64 = pub_conn
-                    .xack("commands", "engine-group", &[entry_id])
+                    .xack("commands", "engine-group", &[entry_id.as_str()])
                     .await?;
+
+                since_snapshot += 1;
+                if let Some(cfg) = &snapshot {
+                    if since_snapshot >= cfg.every {
+                        since_snapshot = 0;
+                        // Trim only once the snapshot is on disk. The other
+                        // order throws away the history recovery depends on.
+                        match snapshot::save(&cfg.path, &entry_id, &engine) {
+                            Ok(()) => snapshot::trim(&mut pub_conn, "commands", &entry_id).await?,
+                            Err(e) => println!("Snapshot write failed, not trimming: {e}"),
+                        }
+                    }
+                }
             }
         }
     }
@@ -2268,5 +2300,158 @@ mod guardrail_tests {
         deposit(&mut engine, 1, Currency::SOL, u64::MAX / 4).unwrap();
         limit(&mut engine, 1, Side::Ask, 100, 5).unwrap();
         assert!(limit(&mut engine, 1, Side::Bid, 100, 5).is_ok()); // self-trade ok
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::snapshot;
+    use crate::types::Limits;
+    use serde_json::Value;
+    use test_util::TEST_PAIR;
+
+    /// HashSet iteration order isn't stable, so a snapshot is never byte-equal
+    /// run to run. Sort the two set-valued fields before comparing — and only
+    /// those, since the book's level queues are FIFO and their order is the
+    /// thing worth checking.
+    fn state(engine: &Engine) -> Value {
+        let mut v = serde_json::to_value(engine).unwrap();
+        for path in [&["dedup", "seen"][..], &["listed_pairs"][..]] {
+            let mut node = &mut v;
+            for key in path {
+                node = &mut node[*key];
+            }
+            if let Some(arr) = node.as_array_mut() {
+                arr.sort_by_key(|x| x.to_string());
+            }
+        }
+        v
+    }
+
+    // Deposits, a listing, resting orders on both sides, and a crossing order
+    // so last_trade_price is set. cid is unique per command or dedup eats it.
+    fn script() -> Vec<(AccountId, u64, Command)> {
+        let mut cmds = vec![
+            (1, 1, Command::ListPair(TEST_PAIR)),
+            (1, 2, Command::Deposit(DepositRequest { amount: 50_000, currency: Currency::USD })),
+            (2, 3, Command::Deposit(DepositRequest { amount: 500, currency: Currency::SOL })),
+        ];
+        let mut cid = 4;
+        for i in 0..8 {
+            cmds.push((2, cid, Command::Place(OrderRequest {
+                pair: TEST_PAIR,
+                order_type: OrderType::Limit,
+                side: Side::Ask,
+                price: 100 + i,
+                size: 3,
+            })));
+            cid += 1;
+            cmds.push((1, cid, Command::Place(OrderRequest {
+                pair: TEST_PAIR,
+                order_type: OrderType::Limit,
+                side: Side::Bid,
+                price: 90 + i,
+                size: 2,
+            })));
+            cid += 1;
+        }
+        // crosses the resting asks
+        cmds.push((1, cid, Command::Place(OrderRequest {
+            pair: TEST_PAIR,
+            order_type: OrderType::Limit,
+            side: Side::Bid,
+            price: 104,
+            size: 5,
+        })));
+        cmds
+    }
+
+    fn run(engine: &mut Engine, cmds: &[(AccountId, u64, Command)]) {
+        for (account, cid, cmd) in cmds {
+            let cmd = serde_json::from_value(serde_json::to_value(cmd).unwrap()).unwrap();
+            apply(engine, *account, *cid, cmd);
+        }
+    }
+
+    fn round_trip(engine: &Engine) -> Engine {
+        serde_json::from_str(&serde_json::to_string(engine).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_engine_survives_json_round_trip() {
+        let mut engine = Engine::new();
+        run(&mut engine, &script());
+        assert!(engine.books[&TEST_PAIR].last_trade_price.is_some());
+        assert_eq!(state(&engine), state(&round_trip(&engine)));
+    }
+
+    // The whole point of the anchor: resuming from a snapshot has to land in
+    // exactly the state a replay from entry zero would have produced.
+    #[test]
+    fn test_resume_from_snapshot_matches_full_replay() {
+        let cmds = script();
+        let split = cmds.len() / 2;
+
+        let mut full = Engine::new();
+        run(&mut full, &cmds);
+
+        let mut resumed = Engine::new();
+        run(&mut resumed, &cmds[..split]);
+        let mut resumed = round_trip(&resumed);
+        run(&mut resumed, &cmds[split..]);
+
+        assert_eq!(state(&full), state(&resumed));
+    }
+
+    // A snapshot taken mid-command-batch would otherwise carry dirty entries
+    // that re-emit events the log already reported.
+    #[test]
+    fn test_scratch_fields_are_not_persisted() {
+        let mut engine = Engine::new();
+        run(&mut engine, &script());
+        engine.ledger.dirty.insert((1, Currency::USD));
+        engine.books.get_mut(&TEST_PAIR).unwrap().dirty_levels.insert((Side::Bid, 100));
+
+        let restored = round_trip(&engine);
+        assert!(restored.ledger.dirty.is_empty());
+        assert!(restored.books[&TEST_PAIR].dirty_levels.is_empty());
+    }
+
+    #[test]
+    fn test_limits_come_from_config_not_snapshot() {
+        let mut engine = Engine::new();
+        engine.limits = Limits::none();
+        run(&mut engine, &script());
+        assert!(round_trip(&engine).limits.price_band_bps.is_some());
+    }
+
+    #[test]
+    fn test_save_load_file_round_trip() {
+        let mut engine = Engine::new();
+        run(&mut engine, &script());
+        let path = std::env::temp_dir().join(format!("engine-snap-{}.json", std::process::id()));
+
+        snapshot::save(&path, "1234-0", &engine).unwrap();
+        let loaded = snapshot::load::<Engine>(&path).unwrap();
+        assert_eq!(loaded.last_id, "1234-0");
+        assert_eq!(state(&engine), state(&loaded.state));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_missing_snapshot_loads_as_none() {
+        let path = std::env::temp_dir().join("engine-snap-does-not-exist.json");
+        assert!(snapshot::load::<Engine>(&path).is_none());
+    }
+
+    // A corrupt snapshot must fall back to full replay, not wedge the boot.
+    #[test]
+    fn test_corrupt_snapshot_loads_as_none() {
+        let path = std::env::temp_dir().join(format!("engine-bad-{}.json", std::process::id()));
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(snapshot::load::<Engine>(&path).is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }

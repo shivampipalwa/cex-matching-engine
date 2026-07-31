@@ -1,11 +1,18 @@
-use matching_engine::{engine::run_engine, types::Engine};
+use matching_engine::{engine::run_engine, snapshot::SnapshotConfig, types::Engine};
 use std::error::Error;
+
+/// Commands between snapshots. Each one lets the `commands` stream be trimmed,
+/// so this also caps how much history a cold start has to replay.
+const SNAPSHOT_EVERY: u64 = 5_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    dotenvy::dotenv().ok();
     println!("Starting Matching Engine");
 
-    let client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let client = redis::Client::open(redis_url)?;
 
     // connection dedicated to the BLOCKING read of commands
     let read_conn = client.get_multiplexed_async_connection().await?;
@@ -29,6 +36,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let engine = Engine::new();
 
-    run_engine(engine, read_conn, pub_conn).await?;
+    // Unset ENGINE_SNAPSHOT_PATH and the engine replays the whole command log
+    // on boot and never trims it — the pre-M8 behaviour.
+    let snapshot = SnapshotConfig::from_env("ENGINE_SNAPSHOT_PATH", SNAPSHOT_EVERY);
+    match &snapshot {
+        Some(cfg) => println!("Snapshotting to {} every {SNAPSHOT_EVERY}", cfg.path.display()),
+        None => println!("Snapshotting disabled"),
+    }
+
+    run_engine(engine, read_conn, pub_conn, snapshot).await?;
     Ok(())
 }
