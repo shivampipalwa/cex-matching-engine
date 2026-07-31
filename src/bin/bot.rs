@@ -31,6 +31,14 @@ struct PlaceResponse {
     order_id: u64,
 }
 
+/// `GET /orders` renders the numeric columns as strings — they're `BigDecimal`
+/// in the projection.
+#[derive(Deserialize)]
+struct OrderRow {
+    order_id: String,
+    status: String,
+}
+
 #[derive(Deserialize)]
 struct BookLevel {
     price: u64,
@@ -117,13 +125,14 @@ impl Bot {
     async fn place(
         &mut self,
         token: &str,
+        order_type: &str,
         side: Side,
         price: u64,
         size: u64,
     ) -> Option<u64> {
         let body = json!({
             "pair": self.pair.to_string(),
-            "order_type": "Limit",
+            "order_type": order_type,
             "side": match side { Side::Bid => "Bid", Side::Ask => "Ask" },
             "price": price,
             "size": size,
@@ -141,6 +150,32 @@ impl Bot {
             .header("X-Client-Order-Id", cid.to_string())
             .send()
             .await;
+    }
+
+    /// Anything this account still has resting. Used once at startup to clear
+    /// leftovers from a previous run — a stale resting order on both sides
+    /// would make every later order look like a self-trade.
+    async fn open_orders(&self, token: &str) -> Vec<u64> {
+        let Ok(resp) = self
+            .http
+            .get(format!("{}/orders", self.base))
+            .bearer_auth(token)
+            .send()
+            .await
+        else {
+            return vec![];
+        };
+        match resp.json::<Vec<OrderRow>>().await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|o| o.status == "open" || o.status == "partially_filled")
+                .filter_map(|o| o.order_id.parse().ok())
+                .collect(),
+            Err(e) => {
+                println!("Could not read open orders: {e}");
+                vec![]
+            }
+        }
     }
 
     async fn book(&self) -> Option<BookSnapshot> {
@@ -220,6 +255,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for token in [maker.clone(), taker.clone()] {
         bot.deposit(&token, pair.quote, quote_ceiling).await;
         bot.deposit(&token, pair.base, base_ceiling).await;
+
+        // Clear anything left resting by a previous run before quoting again.
+        let stale = bot.open_orders(&token).await;
+        if !stale.is_empty() {
+            println!("Cancelling {} stale orders", stale.len());
+            for order_id in stale {
+                bot.cancel(&token, order_id).await;
+            }
+        }
     }
 
     // Anchors the quotes. Re-derived from the book each tick, so the bot
@@ -263,24 +307,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         for i in 0..LEVELS {
             let size = 1 + rng.below(5);
             let bid = mid.saturating_sub(SPREAD + i);
-            if let Some(id) = bot.place(&maker, Side::Bid, bid, size).await {
+            if let Some(id) = bot.place(&maker, "Limit", Side::Bid, bid, size).await {
                 resting.push(id);
             }
             let size = 1 + rng.below(5);
             let ask = mid + SPREAD + i;
-            if let Some(id) = bot.place(&maker, Side::Ask, ask, size).await {
+            if let Some(id) = bot.place(&maker, "Limit", Side::Ask, ask, size).await {
                 resting.push(id);
             }
         }
 
-        // The taker crosses into the maker's touch, which is what actually
-        // prints a trade and moves the chart.
-        let (side, price) = if rng.below(2) == 0 {
-            (Side::Bid, mid + SPREAD)
-        } else {
-            (Side::Ask, mid.saturating_sub(SPREAD))
-        };
-        bot.place(&taker, side, price, 1 + rng.below(3)).await;
+        // Market, not limit. A crossing limit order that isn't fully filled
+        // RESTS, and once the taker has one resting on each side every later
+        // order crosses its own book and gets rejected as a self-trade — it
+        // wedges permanently. A market order's remainder is cancelled, so the
+        // taker never accumulates anything.
+        let side = if rng.below(2) == 0 { Side::Bid } else { Side::Ask };
+        bot.place(&taker, "Market", side, 0, 1 + rng.below(3)).await;
 
         tokio::time::sleep(tick).await;
     }
