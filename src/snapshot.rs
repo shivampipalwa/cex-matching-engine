@@ -15,6 +15,12 @@ use serde::{Serialize, de::DeserializeOwned};
 
 const VERSION: u32 = 1;
 
+/// Where the API publishes how far its book projection has been snapshotted.
+/// db_writer reads it to know how far `events` may be trimmed — the two are
+/// independent consumers of that stream, so the cut is the earlier of the two.
+/// Absent (API not running, or snapshotting off) means don't trim at all.
+pub const BOOK_SNAPSHOT_KEY: &str = "book:snapshot-id";
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Snapshot<T> {
     version: u32,
@@ -77,6 +83,23 @@ pub fn load<T: DeserializeOwned>(path: &Path) -> Option<Snapshot<T>> {
     Some(snapshot)
 }
 
+/// `<ms>-<seq>`, compared numerically. Lexicographic ordering happens to agree
+/// today but breaks the moment the millisecond part changes digit count.
+fn parse_id(id: &str) -> Option<(u64, u64)> {
+    let (ms, seq) = id.split_once('-')?;
+    Some((ms.parse().ok()?, seq.parse().ok()?))
+}
+
+/// The earlier of two stream ids — the furthest a stream can be trimmed when
+/// two independent consumers each need their own history retained.
+pub fn earlier<'a>(a: &'a str, b: &'a str) -> &'a str {
+    match (parse_id(a), parse_id(b)) {
+        (Some(x), Some(y)) if y < x => b,
+        (Some(_), Some(_)) => a,
+        _ => a,
+    }
+}
+
 /// Drop entries older than `min_id`. Approximate (`~`) so Redis can stop at a
 /// node boundary — it may keep more than asked, never less, which is the safe
 /// direction when the retained history is what recovery depends on.
@@ -93,4 +116,43 @@ pub async fn trim(
         .query_async(conn)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::earlier;
+
+    #[test]
+    fn picks_the_earlier_id() {
+        assert_eq!(earlier("100-0", "200-0"), "100-0");
+        assert_eq!(earlier("200-0", "100-0"), "100-0");
+    }
+
+    #[test]
+    fn compares_the_sequence_part() {
+        assert_eq!(earlier("100-5", "100-2"), "100-2");
+        assert_eq!(earlier("100-2", "100-5"), "100-2");
+    }
+
+    #[test]
+    fn equal_ids_are_their_own_earlier() {
+        assert_eq!(earlier("100-1", "100-1"), "100-1");
+    }
+
+    // The reason this isn't a string compare: "9999999999999-0" is
+    // lexicographically after "10000000000000-0" but chronologically before it.
+    #[test]
+    fn survives_a_millisecond_digit_rollover() {
+        let before = "9999999999999-0";
+        let after = "10000000000000-0";
+        assert!(before > after); // lexicographic, and wrong
+        assert_eq!(earlier(before, after), before);
+        assert_eq!(earlier(after, before), before);
+    }
+
+    // A malformed id must not silently trim further than intended.
+    #[test]
+    fn unparseable_id_falls_back_to_first() {
+        assert_eq!(earlier("100-0", "garbage"), "100-0");
+    }
 }

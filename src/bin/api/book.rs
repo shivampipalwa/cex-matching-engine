@@ -15,7 +15,10 @@ use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
 };
-use matching_engine::types::{Event, EventBatch, Pair, Side};
+use matching_engine::{
+    snapshot::{self, SnapshotConfig},
+    types::{Event, EventBatch, Pair, Side},
+};
 use redis::{
     AsyncCommands,
     aio::MultiplexedConnection,
@@ -32,7 +35,7 @@ const MAX_DEPTH: usize = 1000; // guard against a client asking for an absurd de
 
 /// One market's price-level aggregates. `qty` at a price is the level's
 /// CURRENT total — mirrors `BookDelta`'s "set", never accumulated.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Book {
     bids: BTreeMap<u64, u64>, // ascending; best bid = LAST (highest)
     asks: BTreeMap<u64, u64>, // ascending; best ask = FIRST (lowest)
@@ -42,7 +45,8 @@ struct Book {
 /// see levels from one seq paired with a `last_seq` from another — the same
 /// atomicity concern db_writer solves with a transaction, solved here with a
 /// lock since this state lives in memory, not Postgres.
-struct BookState {
+#[derive(Serialize, Deserialize)]
+pub(crate) struct BookState {
     books: HashMap<Pair, Book>,
     last_seq: u64,
 }
@@ -59,6 +63,14 @@ impl BookStore {
                 last_seq: 0,
             }),
         }
+    }
+
+    fn restore(&self, state: BookState) {
+        *self.state.write().unwrap() = state;
+    }
+
+    fn persist<T>(&self, f: impl FnOnce(&BookState) -> T) -> T {
+        f(&self.state.read().unwrap())
     }
 
     /// Apply one command's WHOLE batch while holding the write lock for the
@@ -133,15 +145,24 @@ pub(crate) struct BookSnapshot {
     asks: Vec<BookLevel>,
 }
 
-/// Replay the whole `events` stream once at startup to build the book from
-/// scratch (mirrors the engine's own recovery). Returns the last entry's
+/// Rebuild the book at startup, from a snapshot plus the events after it, or
+/// from the whole stream if there's no snapshot. Returns the last entry's
 /// stream id, so the live tail knows where to pick up from.
 pub(crate) async fn bootstrap(
     conn: &mut MultiplexedConnection,
     store: &BookStore,
+    snapshot: Option<&SnapshotConfig>,
 ) -> Result<String, Box<dyn Error>> {
-    let reply: StreamRangeReply = conn.xrange("events", "-", "+").await?;
-    let mut last_id = "0".to_string();
+    let (from, mut last_id) = match snapshot.and_then(|c| snapshot::load::<BookState>(&c.path)) {
+        Some(snap) => {
+            println!("Restored book snapshot at {}", snap.last_id);
+            store.restore(snap.state);
+            (format!("({}", snap.last_id), snap.last_id)
+        }
+        None => ("-".to_string(), "0".to_string()),
+    };
+
+    let reply: StreamRangeReply = conn.xrange("events", from, "+").await?;
     for entry in reply.ids {
         let Some(data): Option<String> = entry.get("data") else {
             continue;
@@ -165,8 +186,10 @@ pub(crate) async fn tail(
     store: Arc<BookStore>,
     mut last_id: String,
     event_tx: broadcast::Sender<Arc<EventBatch>>,
+    snapshot: Option<SnapshotConfig>,
 ) -> Result<(), Box<dyn Error>> {
     let opts = StreamReadOptions::default().block(5000);
+    let mut since_snapshot = 0u64;
     loop {
         let reply: StreamReadReply = conn
             .xread_options(&["events"], &[last_id.as_str()], &opts)
@@ -184,6 +207,22 @@ pub(crate) async fn tail(
                 // Errors only when there are currently zero receivers — not a
                 // failure, just nobody subscribed at this instant.
                 let _ = event_tx.send(Arc::new(batch));
+                since_snapshot += 1;
+            }
+        }
+
+        if let Some(cfg) = &snapshot {
+            if since_snapshot >= cfg.every {
+                since_snapshot = 0;
+                match store.persist(|s| snapshot::save(&cfg.path, &last_id, s)) {
+                    // Publish only after the write lands: db_writer trims
+                    // `events` on the strength of this id.
+                    Ok(()) => {
+                        let _: redis::RedisResult<()> =
+                            conn.set(snapshot::BOOK_SNAPSHOT_KEY, last_id.as_str()).await;
+                    }
+                    Err(e) => println!("Book snapshot write failed: {e}"),
+                }
             }
         }
     }

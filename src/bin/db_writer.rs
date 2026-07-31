@@ -1,5 +1,8 @@
 use bigdecimal::BigDecimal;
-use matching_engine::types::{Event, EventBatch, OrderType, Side};
+use matching_engine::{
+    snapshot,
+    types::{Event, EventBatch, OrderType, Side},
+};
 use redis::{
     AsyncCommands,
     aio::MultiplexedConnection,
@@ -7,6 +10,10 @@ use redis::{
 };
 use sqlx::{Postgres, Transaction};
 use std::error::Error;
+
+/// Committed batches between trim attempts — the check costs a GET, so it
+/// isn't worth doing on every one.
+const TRIM_EVERY_BATCHES: u64 = 100;
 
 async fn ack_event(
     conn: &mut MultiplexedConnection,
@@ -147,7 +154,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // sqlx::migrate!("./migrations").run(&pool).await?;
 
     // connect to redis
-    let client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let client = redis::Client::open(redis_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
     // create consumer group "db-writers" on "events" stream starting at 0
@@ -169,6 +178,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .group("db-writers", "db-1")
         .block(5000)
         .count(10);
+
+    let mut batches_since_trim = 0u64;
 
     loop {
         let reply: StreamReadReply = conn.xread_options(&["events"], &[">"], &opts).await?;
@@ -222,6 +233,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         for entry_id in staged.iter().chain(poison.iter()) {
             ack_event(&mut conn, entry_id).await?;
+        }
+
+        // `events` has two independent readers: this one, and the API's book
+        // projection. Trim to whichever is further behind, and only once both
+        // have durably kept up — no key means the API isn't snapshotting, in
+        // which case its bootstrap still needs the whole stream.
+        if let Some(committed) = staged.last() {
+            batches_since_trim += 1;
+            if batches_since_trim >= TRIM_EVERY_BATCHES {
+                batches_since_trim = 0;
+                let book: Option<String> = conn.get(snapshot::BOOK_SNAPSHOT_KEY).await?;
+                if let Some(book) = book {
+                    let cut = snapshot::earlier(committed, &book);
+                    snapshot::trim(&mut conn, "events", cut).await?;
+                }
+            }
         }
     }
 

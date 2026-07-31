@@ -12,13 +12,16 @@ use axum::{
 use bigdecimal::BigDecimal;
 use futures_util::StreamExt;
 use jsonwebtoken::{DecodingKey, EncodingKey};
-use matching_engine::types::{
-    AccountId, CancelRequest,
-    Command::{self},
-    CommandEnvelope,
-    CommandResponse::{self},
-    Currency, DepositRequest, EventBatch, OrderRequest, OrderType, Pair, ResponseEnvelope, Side,
-    WithdrawRequest,
+use matching_engine::{
+    snapshot::SnapshotConfig,
+    types::{
+        AccountId, CancelRequest,
+        Command::{self},
+        CommandEnvelope,
+        CommandResponse::{self},
+        Currency, DepositRequest, EventBatch, OrderRequest, OrderType, Pair, ResponseEnvelope,
+        Side, WithdrawRequest,
+    },
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 use serde::{Deserialize, Serialize};
@@ -48,6 +51,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// this many batches behind gets `Lagged` and is disconnected (see `ws.rs`)
 /// rather than the channel growing unbounded.
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
+
+/// Event batches between book-projection snapshots. Also gates how far
+/// db_writer may trim `events`.
+const BOOK_SNAPSHOT_EVERY: u64 = 5_000;
 
 const DEFAULT_CANDLES_LIMIT: i64 = 200;
 const MAX_CANDLES_LIMIT: i64 = 1000;
@@ -158,7 +165,9 @@ fn interval_seconds(interval: &str) -> Option<i64> {
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
 
-    let client = Client::open("redis://127.0.0.1:6379/")?;
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    let client = Client::open(redis_url)?;
     let xadd_conn = client.get_multiplexed_async_connection().await?;
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
@@ -183,7 +192,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // see a partially-built book.
     let book_store = Arc::new(book::BookStore::new());
     let mut book_conn = client.get_multiplexed_async_connection().await?;
-    let last_id = book::bootstrap(&mut book_conn, &book_store).await?;
+    let book_snapshot = SnapshotConfig::from_env("BOOK_SNAPSHOT_PATH", BOOK_SNAPSHOT_EVERY);
+    let last_id = book::bootstrap(&mut book_conn, &book_store, book_snapshot.as_ref()).await?;
     // Lagging receivers get dropped (see EVENT_BROADCAST_CAPACITY); the
     // initial receiver returned here is unused — every real subscriber comes
     // from `event_tx.subscribe()` in a websocket handler.
@@ -192,7 +202,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let store = book_store.clone();
         let event_tx = event_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = book::tail(book_conn, store, last_id, event_tx).await {
+            if let Err(e) = book::tail(book_conn, store, last_id, event_tx, book_snapshot).await {
                 eprintln!("book projection terminated: {e}");
             }
         });
@@ -229,8 +239,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
-    println!("API listening on http://127.0.0.1:3000");
+    // 0.0.0.0 by default: inside a container, loopback is unreachable from
+    // anywhere useful.
+    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("API listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
