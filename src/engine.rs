@@ -1,8 +1,8 @@
 use crate::types::{
     AccountId, Balance, CancelRequest, Command, CommandEnvelope, CommandResponse, Currency, Dedup,
-    Engine, Event, EventBatch, Ledger, MatchResponse, Order, OrderBook, OrderLocation, OrderRequest,
-    OrderStatus, OrderType, OrderUpdate, Pair, PlaceOrderResponse, RejectReason, ResponseEnvelope,
-    Side, Trade,
+    DepositRequest, Engine, Event, EventBatch, Ledger, MatchResponse, Order, OrderBook,
+    OrderLocation, OrderRequest, OrderStatus, OrderType, OrderUpdate, Pair, PlaceOrderResponse,
+    RejectReason, ResponseEnvelope, Side, Trade,
 };
 use redis::{AsyncCommands, aio::MultiplexedConnection, streams::StreamRangeReply};
 use std::{cmp::min, collections::VecDeque, error::Error};
@@ -78,6 +78,8 @@ impl OrderBook {
                         taker_account: order.account_id,
                     };
                     trades.push(trade);
+
+                    self.last_trade_price = Some(trade.price);
 
                     // The maker's level changed size — mark it before it might
                     // get popped below. `take_dirty_levels` recomputes the
@@ -210,6 +212,44 @@ impl OrderBook {
         Ok(cost)
     }
 
+    /// Would this order match one of the same account's resting orders?
+    /// Mirrors `add_order`'s crossing rule, read-only.
+    fn would_self_trade(&self, account_id: AccountId, req: &OrderRequest) -> bool {
+        fn scan<'a>(
+            levels: impl Iterator<Item = (&'a u64, &'a VecDeque<Order>)>,
+            account_id: AccountId,
+            size: u64,
+            crosses: impl Fn(u64) -> bool,
+        ) -> bool {
+            let mut remaining = size;
+            for (&price, level) in levels {
+                if !crosses(price) {
+                    return false;
+                }
+                for resting in level {
+                    if resting.account_id == account_id {
+                        return true;
+                    }
+                    remaining = remaining.saturating_sub(resting.remaining_size);
+                    if remaining == 0 {
+                        return false;
+                    }
+                }
+            }
+            false
+        }
+
+        let market = req.order_type == OrderType::Market;
+        match req.side {
+            Side::Bid => scan(self.asks.iter(), account_id, req.size, |p| {
+                market || p <= req.price
+            }),
+            Side::Ask => scan(self.bids.iter().rev(), account_id, req.size, |p| {
+                market || p >= req.price
+            }),
+        }
+    }
+
     /// Drain the dirty-level set into `(side, price, new_qty)` triples,
     /// recomputing each level's CURRENT aggregate — correct regardless of
     /// whether the level survived, shrank, or emptied out since being marked.
@@ -287,6 +327,15 @@ impl Ledger {
         balance.available += amount;
         self.dirty.insert((account_id, currency));
         balance.available
+    }
+
+    /// available + reserved
+    fn held(&self, account_id: AccountId, currency: Currency) -> u64 {
+        self.balances
+            .get(&account_id)
+            .and_then(|b| b.get(&currency))
+            .map(|b| b.available + b.reserved)
+            .unwrap_or(0)
     }
 
     fn withdraw(
@@ -393,6 +442,13 @@ impl Ledger {
 /// Most recent client_order_ids kept per account before older ones are evicted.
 const DEDUP_WINDOW: usize = 1000;
 
+/// Widened to at least ±1 so a market trading in single digits doesn't collapse
+/// to a band of one price.
+fn price_band(last: u64, bps: u64) -> (u64, u64) {
+    let delta = (last.saturating_mul(bps) / 10_000).max(1);
+    (last.saturating_sub(delta), last.saturating_add(delta))
+}
+
 impl Dedup {
     /// Returns false if this (account_id, client_order_id) was already seen.
     fn insert(&mut self, account_id: AccountId, client_order_id: u64) -> bool {
@@ -417,6 +473,21 @@ impl Engine {
     ) -> Result<MatchResponse, RejectReason> {
         if !req.pair.is_valid() || !self.listed_pairs.contains(&req.pair) {
             return Err(RejectReason::InvalidPair);
+        }
+
+        if let Some(book) = self.books.get(&req.pair) {
+            if req.order_type == OrderType::Limit {
+                if let (Some(bps), Some(last)) = (self.limits.price_band_bps, book.last_trade_price)
+                {
+                    let (low, high) = price_band(last, bps);
+                    if req.price < low || req.price > high {
+                        return Err(RejectReason::PriceOutOfBand);
+                    }
+                }
+            }
+            if self.limits.prevent_self_trade && book.would_self_trade(account_id, req) {
+                return Err(RejectReason::SelfTrade);
+            }
         }
         // A market buy has no limit price to size a reserve from, but nothing
         // else can touch the book before `add_order` below runs, so the exact
@@ -494,6 +565,22 @@ impl Engine {
 
         Ok(match_result)
     }
+    fn deposit(
+        &mut self,
+        account_id: AccountId,
+        req: &DepositRequest,
+    ) -> Result<u64, RejectReason> {
+        let after = self
+            .ledger
+            .held(account_id, req.currency)
+            .checked_add(req.amount)
+            .ok_or(RejectReason::InvalidAmount)?;
+        if after > (self.limits.deposit_ceiling)(req.currency) {
+            return Err(RejectReason::DepositLimitExceeded);
+        }
+        Ok(self.ledger.deposit(req.currency, account_id, req.amount))
+    }
+
     // Returns the removed order (with its market) plus the book deltas its
     // removal caused, so callers can emit both the order's final state and the
     // level change.
@@ -604,11 +691,7 @@ pub fn apply(
             CommandResponse::Cancel(cancelled)
         }
         Command::Deposit(deposit_request) => {
-            let available_balance =
-                engine
-                    .ledger
-                    .deposit(deposit_request.currency, account_id, deposit_request.amount);
-            CommandResponse::Deposit(available_balance)
+            CommandResponse::Deposit(engine.deposit(account_id, &deposit_request))
         }
         Command::Withdraw(withdraw_request) => {
             let res = engine
@@ -1980,5 +2063,210 @@ mod book_delta_tests {
         // A second, unrelated resting order at a different level.
         let res = place_full(&mut book, OrderType::Limit, Side::Bid, 50, 3);
         assert_eq!(res.book_deltas, vec![(Side::Bid, 50, 3)]); // not the ask too
+    }
+}
+
+#[cfg(test)]
+mod guardrail_tests {
+    use super::*;
+    use crate::types::Limits;
+    use test_util::{TEST_PAIR, new_engine};
+
+    fn deposit(engine: &mut Engine, account: AccountId, currency: Currency, amount: u64)
+    -> Result<u64, RejectReason> {
+        engine.deposit(account, &DepositRequest { amount, currency })
+    }
+
+    fn limit(engine: &mut Engine, account: AccountId, side: Side, price: u64, size: u64)
+    -> Result<MatchResponse, RejectReason> {
+        engine.place_order(account, &OrderRequest {
+            pair: TEST_PAIR,
+            order_type: OrderType::Limit,
+            side,
+            price,
+            size,
+        })
+    }
+
+    // Two orders that cross, from different accounts, to set last_trade_price.
+    fn seed_price(engine: &mut Engine, price: u64) {
+        let _ = deposit(engine, 1, Currency::USD, price * 2);
+        let _ = deposit(engine, 2, Currency::SOL, 2);
+        limit(engine, 2, Side::Ask, price, 1).unwrap();
+        limit(engine, 1, Side::Bid, price, 1).unwrap();
+        assert_eq!(engine.books[&TEST_PAIR].last_trade_price, Some(price));
+    }
+
+    #[test]
+    fn test_deposit_up_to_ceiling_allowed() {
+        let mut engine = new_engine();
+        let ceiling = (engine.limits.deposit_ceiling)(Currency::USD);
+        assert_eq!(deposit(&mut engine, 1, Currency::USD, ceiling), Ok(ceiling));
+    }
+
+    #[test]
+    fn test_deposit_past_ceiling_rejected() {
+        let mut engine = new_engine();
+        let ceiling = (engine.limits.deposit_ceiling)(Currency::USD);
+        assert_eq!(
+            deposit(&mut engine, 1, Currency::USD, ceiling + 1),
+            Err(RejectReason::DepositLimitExceeded)
+        );
+    }
+
+    // The ceiling caps the holding, so repeating the request can't get past it.
+    #[test]
+    fn test_repeated_deposits_cannot_exceed_ceiling() {
+        let mut engine = new_engine();
+        let ceiling = (engine.limits.deposit_ceiling)(Currency::USD);
+        assert!(deposit(&mut engine, 1, Currency::USD, ceiling).is_ok());
+        assert_eq!(
+            deposit(&mut engine, 1, Currency::USD, 1),
+            Err(RejectReason::DepositLimitExceeded)
+        );
+    }
+
+    // Funds parked in a resting order still count, or you could park and top up.
+    #[test]
+    fn test_reserved_funds_count_toward_ceiling() {
+        let mut engine = new_engine();
+        let ceiling = (engine.limits.deposit_ceiling)(Currency::SOL);
+        deposit(&mut engine, 1, Currency::SOL, ceiling).unwrap();
+        limit(&mut engine, 1, Side::Ask, 100, ceiling).unwrap();
+        assert_eq!(engine.ledger.balances[&1][&Currency::SOL].available, 0);
+        assert_eq!(
+            deposit(&mut engine, 1, Currency::SOL, 1),
+            Err(RejectReason::DepositLimitExceeded)
+        );
+    }
+
+    // Losing money frees room under the ceiling again.
+    #[test]
+    fn test_can_top_back_up_after_spending() {
+        let mut engine = new_engine();
+        let ceiling = (engine.limits.deposit_ceiling)(Currency::USD);
+        deposit(&mut engine, 1, Currency::USD, ceiling).unwrap();
+        engine.ledger.withdraw(1, Currency::USD, 500).unwrap();
+        assert_eq!(deposit(&mut engine, 1, Currency::USD, 500), Ok(ceiling));
+    }
+
+    // Nothing to anchor a band to until the market has traded once.
+    #[test]
+    fn test_no_band_before_first_trade() {
+        let mut engine = new_engine();
+        deposit(&mut engine, 1, Currency::SOL, 10).unwrap();
+        assert!(limit(&mut engine, 1, Side::Ask, 99_999, 1).is_ok());
+    }
+
+    #[test]
+    fn test_order_inside_band_accepted() {
+        let mut engine = new_engine();
+        seed_price(&mut engine, 100);
+        deposit(&mut engine, 3, Currency::SOL, 10).unwrap();
+        assert!(limit(&mut engine, 3, Side::Ask, 119, 1).is_ok()); // +19%
+    }
+
+    #[test]
+    fn test_order_outside_band_rejected() {
+        let mut engine = new_engine();
+        seed_price(&mut engine, 100);
+        deposit(&mut engine, 3, Currency::SOL, 10).unwrap();
+        // +21%
+        assert_eq!(
+            limit(&mut engine, 3, Side::Ask, 121, 1).unwrap_err(),
+            RejectReason::PriceOutOfBand
+        );
+    }
+
+    // The cheap way to paint the chart: a lone bid at price 1.
+    #[test]
+    fn test_lowball_bid_rejected_by_band() {
+        let mut engine = new_engine();
+        seed_price(&mut engine, 100);
+        deposit(&mut engine, 3, Currency::USD, 1_000).unwrap();
+        assert_eq!(limit(&mut engine, 3, Side::Bid, 1, 1).unwrap_err(), RejectReason::PriceOutOfBand);
+    }
+
+    // Rejected before anything is reserved.
+    #[test]
+    fn test_band_rejection_reserves_nothing() {
+        let mut engine = new_engine();
+        seed_price(&mut engine, 100);
+        deposit(&mut engine, 3, Currency::USD, 1_000).unwrap();
+        assert!(limit(&mut engine, 3, Side::Bid, 1, 1).is_err());
+        assert_eq!(engine.ledger.balances[&3][&Currency::USD].reserved, 0);
+        assert_eq!(engine.ledger.balances[&3][&Currency::USD].available, 1_000);
+    }
+
+    #[test]
+    fn test_self_trade_rejected() {
+        let mut engine = new_engine();
+        deposit(&mut engine, 1, Currency::SOL, 10).unwrap();
+        deposit(&mut engine, 1, Currency::USD, 1_000).unwrap();
+        limit(&mut engine, 1, Side::Ask, 100, 5).unwrap();
+        assert_eq!(limit(&mut engine, 1, Side::Bid, 100, 5).unwrap_err(), RejectReason::SelfTrade);
+    }
+
+    // Resting against your own book on the other side is fine — it only matters
+    // when the incoming order would actually cross into it.
+    #[test]
+    fn test_own_resting_order_not_crossed_is_fine() {
+        let mut engine = new_engine();
+        deposit(&mut engine, 1, Currency::SOL, 10).unwrap();
+        deposit(&mut engine, 1, Currency::USD, 1_000).unwrap();
+        limit(&mut engine, 1, Side::Ask, 100, 5).unwrap();
+        assert!(limit(&mut engine, 1, Side::Bid, 90, 5).is_ok());
+    }
+
+    #[test]
+    fn test_market_order_self_trade_rejected() {
+        let mut engine = new_engine();
+        deposit(&mut engine, 1, Currency::SOL, 10).unwrap();
+        deposit(&mut engine, 1, Currency::USD, 1_000).unwrap();
+        limit(&mut engine, 1, Side::Ask, 100, 5).unwrap();
+        let res = engine.place_order(1, &OrderRequest {
+            pair: TEST_PAIR,
+            order_type: OrderType::Market,
+            side: Side::Bid,
+            price: 0,
+            size: 1,
+        });
+        assert_eq!(res.unwrap_err(), RejectReason::SelfTrade);
+    }
+
+    // Someone else's order sitting in front is still crossed into, so the scan
+    // has to look past the touch rather than stopping at the best level.
+    #[test]
+    fn test_self_trade_detected_behind_another_account() {
+        let mut engine = new_engine();
+        deposit(&mut engine, 2, Currency::SOL, 10).unwrap();
+        deposit(&mut engine, 1, Currency::SOL, 10).unwrap();
+        deposit(&mut engine, 1, Currency::USD, 1_000).unwrap();
+        limit(&mut engine, 2, Side::Ask, 100, 1).unwrap();
+        limit(&mut engine, 1, Side::Ask, 101, 5).unwrap();
+        assert_eq!(limit(&mut engine, 1, Side::Bid, 101, 4).unwrap_err(), RejectReason::SelfTrade);
+    }
+
+    // ...but an order that fills entirely against the other account never
+    // reaches its own resting order, so it stands.
+    #[test]
+    fn test_no_self_trade_when_filled_before_reaching_own_order() {
+        let mut engine = new_engine();
+        deposit(&mut engine, 2, Currency::SOL, 10).unwrap();
+        deposit(&mut engine, 1, Currency::SOL, 10).unwrap();
+        deposit(&mut engine, 1, Currency::USD, 1_000).unwrap();
+        limit(&mut engine, 2, Side::Ask, 100, 5).unwrap();
+        limit(&mut engine, 1, Side::Ask, 101, 5).unwrap();
+        assert!(limit(&mut engine, 1, Side::Bid, 101, 5).is_ok());
+    }
+
+    #[test]
+    fn test_limits_none_disables_every_guard() {
+        let mut engine = new_engine();
+        engine.limits = Limits::none();
+        deposit(&mut engine, 1, Currency::USD, u64::MAX / 4).unwrap();
+        deposit(&mut engine, 1, Currency::SOL, u64::MAX / 4).unwrap();
+        limit(&mut engine, 1, Side::Ask, 100, 5).unwrap();
+        assert!(limit(&mut engine, 1, Side::Bid, 100, 5).is_ok()); // self-trade ok
     }
 }

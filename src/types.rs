@@ -19,7 +19,7 @@ pub enum OrderType {
     Limit,  // execute at a specific price or better
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Order {
     pub id: u64, // assigned by the engine from a monotonic counter (0 = unassigned placeholder)
     pub order_type: OrderType,
@@ -30,7 +30,7 @@ pub struct Order {
     pub account_id: AccountId,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct OrderLocation {
     pub owner: AccountId,
     pub side: Side,
@@ -147,7 +147,8 @@ pub struct WithdrawRequest {
 pub enum CommandResponse {
     Place(Result<PlaceOrderResponse, RejectReason>),
     Cancel(bool),
-    Deposit(u64),
+    // Ok = new available balance
+    Deposit(Result<u64, RejectReason>),
     Withdraw(Result<(), RejectReason>),
     // true = newly listed, false = was already listed (still success).
     ListPair(Result<bool, RejectReason>),
@@ -212,28 +213,74 @@ pub enum Currency {
 
 pub type AccountId = u64;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 pub struct Balance {
     pub available: u64,
     pub reserved: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Ledger {
     pub balances: HashMap<AccountId, HashMap<Currency, Balance>>,
+    // scratch, always empty at a command boundary — not worth snapshotting
+    #[serde(skip)]
     pub dirty: HashSet<(AccountId, Currency)>,
 }
 
 /// Idempotency keys seen so far, bounded to the most recent
 /// `DEDUP_WINDOW` per account instead of growing forever. Eviction is by
 /// insertion count, not wall-clock time, so it stays deterministic under replay.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Dedup {
     pub seen: HashSet<(AccountId, u64)>,
     pub order: HashMap<AccountId, VecDeque<u64>>,
 }
 
-#[derive(Debug)]
+/// Abuse guards for a public deployment, where `/deposits` is an open faucet
+/// and anyone can trade. Policy, not state — benchmarks turn them off with
+/// `Limits::none()` to measure matching rather than these checks.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Most an account may hold of a currency (available + reserved). Capping
+    /// the holding rather than the request means asking twice doesn't help.
+    pub deposit_ceiling: fn(Currency) -> u64,
+    /// How far a limit order may sit from the last traded price, in bps.
+    pub price_band_bps: Option<u64>,
+    pub prevent_self_trade: bool,
+}
+
+fn demo_deposit_ceiling(currency: Currency) -> u64 {
+    match currency {
+        Currency::USD => 100_000,
+        Currency::SOL => 1_000,
+    }
+}
+
+fn no_deposit_ceiling(_: Currency) -> u64 {
+    u64::MAX
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            deposit_ceiling: demo_deposit_ceiling,
+            price_band_bps: Some(2000),
+            prevent_self_trade: true,
+        }
+    }
+}
+
+impl Limits {
+    pub fn none() -> Self {
+        Limits {
+            deposit_ceiling: no_deposit_ceiling,
+            price_band_bps: None,
+            prevent_self_trade: false,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Engine {
     /// One book per market. Created on first order for that pair.
     pub books: HashMap<Pair, OrderBook>,
@@ -249,6 +296,11 @@ pub struct Engine {
     /// Markets open for trading. `place_order` rejects any pair not in here —
     /// listing is itself a command, so this is replayable state like everything else.
     pub listed_pairs: HashSet<Pair>,
+    /// Config, not state: never snapshotted, so a restore always comes back
+    /// with the deployment's own limits rather than whatever was set when the
+    /// snapshot was written.
+    #[serde(skip)]
+    pub limits: Limits,
 }
 
 impl Engine {
@@ -267,6 +319,7 @@ impl Engine {
                 order: HashMap::new(),
             },
             listed_pairs: HashSet::new(),
+            limits: Limits::default(),
         }
     }
 }
@@ -281,7 +334,7 @@ impl Default for Engine {
 // key = price
 // value = queue of orders
 // Used btreemap to keep the orders sorted by price
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct OrderBook {
     pub bids: BTreeMap<u64, VecDeque<Order>>,
     pub asks: BTreeMap<u64, VecDeque<Order>>,
@@ -289,7 +342,10 @@ pub struct OrderBook {
     /// (side, price) levels whose aggregate qty changed due to current command.
     /// Drained into BookDelta events by `take_dirty_levels` — this patter is same as
     /// `Ledger.dirty`.
+    #[serde(skip)]
     pub dirty_levels: HashSet<(Side, u64)>,
+    /// Anchors the price band. None until this market's first trade.
+    pub last_trade_price: Option<u64>,
 }
 
 impl OrderBook {
@@ -299,6 +355,7 @@ impl OrderBook {
             asks: BTreeMap::new(),
             order_index: HashMap::new(),
             dirty_levels: HashSet::new(),
+            last_trade_price: None,
         }
     }
 }
@@ -309,12 +366,15 @@ impl Default for OrderBook {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum RejectReason {
     InsufficientFunds,
     UnsupportedOrderType,
     InvalidAmount,
     InvalidPair,
+    DepositLimitExceeded,
+    PriceOutOfBand,
+    SelfTrade,
 }
 
 // output event stream from engine for db writer, etc.

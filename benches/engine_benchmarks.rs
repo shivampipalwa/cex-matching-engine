@@ -4,7 +4,7 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use matching_engine::engine::apply;
 use matching_engine::types::{
-    CancelRequest, Command, CommandResponse, Currency, DepositRequest, Engine, OrderRequest,
+    CancelRequest, Command, CommandResponse, Currency, DepositRequest, Engine, Limits, OrderRequest,
     OrderType, Pair, Side,
 };
 
@@ -15,6 +15,8 @@ const PAIR: Pair = Pair {
 
 fn funded_engine() -> Engine {
     let mut engine = Engine::new();
+    // measure matching, not the deposit ceiling / price band / self-trade checks
+    engine.limits = Limits::none();
     engine.listed_pairs.insert(PAIR);
     // client_order_id 0 is reserved for these seed deposits — every benchmark
     // below uses ids >= 1, so nothing collides with them.

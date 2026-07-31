@@ -308,9 +308,10 @@ fn response_for(resp: CommandResponse) -> Response {
         CommandResponse::Place(Err(e)) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
         CommandResponse::Cancel(true) => StatusCode::NO_CONTENT.into_response(),
         CommandResponse::Cancel(false) => ApiError::NotFound.into_response(),
-        CommandResponse::Deposit(available) => {
+        CommandResponse::Deposit(Ok(available)) => {
             (StatusCode::OK, Json(json!({ "available": available }))).into_response()
         }
+        CommandResponse::Deposit(Err(e)) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
         CommandResponse::Withdraw(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         CommandResponse::Withdraw(Err(e)) => (StatusCode::BAD_REQUEST, Json(e)).into_response(),
         CommandResponse::ListPair(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
