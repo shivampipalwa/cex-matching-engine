@@ -2,3 +2,4 @@
 /DESIGN.md
 .env
 .dev-pids
+deploy/.env

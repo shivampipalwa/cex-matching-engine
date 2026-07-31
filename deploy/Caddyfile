@@ -1,0 +1,19 @@
+# One origin for the SPA and the API, so there's no CORS and no mixed content.
+# Set SITE_ADDRESS to a hostname and Caddy provisions TLS itself; set it to
+# :80 to run without.
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	# handle_path strips the prefix, so /api/book/SOL-USD reaches the API as
+	# /book/SOL-USD. Websockets upgrade through this untouched.
+	handle_path /api/* {
+		reverse_proxy api:3000
+	}
+
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

@@ -1,0 +1,8 @@
+target
+.git
+.env
+.dev-pids
+DESIGN.md
+deploy
+docs
+*.md

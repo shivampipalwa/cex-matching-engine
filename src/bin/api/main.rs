@@ -192,7 +192,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // see a partially-built book.
     let book_store = Arc::new(book::BookStore::new());
     let mut book_conn = client.get_multiplexed_async_connection().await?;
-    let book_snapshot = SnapshotConfig::from_env("BOOK_SNAPSHOT_PATH", BOOK_SNAPSHOT_EVERY);
+    let book_snapshot = SnapshotConfig::from_env(
+        "BOOK_SNAPSHOT_PATH",
+        "BOOK_SNAPSHOT_EVERY",
+        BOOK_SNAPSHOT_EVERY,
+    );
     let last_id = book::bootstrap(&mut book_conn, &book_store, book_snapshot.as_ref()).await?;
     // Lagging receivers get dropped (see EVENT_BROADCAST_CAPACITY); the
     // initial receiver returned here is unused — every real subscriber comes

@@ -38,9 +38,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Unset ENGINE_SNAPSHOT_PATH and the engine replays the whole command log
     // on boot and never trims it — the pre-M8 behaviour.
-    let snapshot = SnapshotConfig::from_env("ENGINE_SNAPSHOT_PATH", SNAPSHOT_EVERY);
+    let snapshot = SnapshotConfig::from_env(
+        "ENGINE_SNAPSHOT_PATH",
+        "ENGINE_SNAPSHOT_EVERY",
+        SNAPSHOT_EVERY,
+    );
     match &snapshot {
-        Some(cfg) => println!("Snapshotting to {} every {SNAPSHOT_EVERY}", cfg.path.display()),
+        Some(cfg) => println!(
+            "Snapshotting to {} every {} commands",
+            cfg.path.display(),
+            cfg.every
+        ),
         None => println!("Snapshotting disabled"),
     }
 

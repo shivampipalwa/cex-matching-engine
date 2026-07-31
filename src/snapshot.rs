@@ -37,10 +37,16 @@ pub struct SnapshotConfig {
 }
 
 impl SnapshotConfig {
-    /// `<var>` if set, otherwise snapshotting (and therefore trimming) is off.
-    pub fn from_env(var: &str, every: u64) -> Option<Self> {
-        std::env::var(var).ok().filter(|p| !p.is_empty()).map(|p| SnapshotConfig {
-            path: PathBuf::from(p),
+    /// No `path_var` means snapshotting — and therefore trimming — is off.
+    pub fn from_env(path_var: &str, every_var: &str, default_every: u64) -> Option<Self> {
+        let path = std::env::var(path_var).ok().filter(|p| !p.is_empty())?;
+        let every = std::env::var(every_var)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(default_every);
+        Some(SnapshotConfig {
+            path: PathBuf::from(path),
             every,
         })
     }
