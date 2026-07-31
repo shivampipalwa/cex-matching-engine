@@ -18,7 +18,13 @@ const orders1_ = [];
 const orders2_ = [];
 let badClosed = false;
 
-const opened = (ws) => new Promise((resolve) => ws.addEventListener("open", resolve, { once: true }));
+// All four sockets are constructed above, so any of them may already be open
+// by the time it's awaited — attaching an "open" listener then would wait for
+// an event that has already fired.
+const opened = (ws) =>
+  ws.readyState === WebSocket.OPEN
+    ? Promise.resolve()
+    : new Promise((resolve) => ws.addEventListener("open", resolve, { once: true }));
 
 market.addEventListener("message", (e) => market_.push(JSON.parse(e.data)));
 orders1.addEventListener("message", (e) => orders1_.push(JSON.parse(e.data)));

@@ -136,8 +136,11 @@ code=$(post "$API/withdrawals" '{"amount":3,"currency":"SOL"}' "Authorization: B
 assert_eq "non-USD withdrawal accepted" "$code" "204"
 
 echo "== 10. cancel (ownership enforced by the engine) =="
-# buyer rests a bid that won't cross
-resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":1,"size":5}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 20")
+# buyer rests a bid that won't cross. Below the touch but inside the price
+# band around the last trade (100) — price 1 would now be rejected outright,
+# and at 85 the order costs enough that the buyer needs topping up first.
+post "$API/deposits" '{"amount":500,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 19" >/dev/null
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":85,"size":5}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 20")
 OID=$(echo "$resp" | head -1 | jq -r .order_id)
 assert_eq "resting bid accepted" "$(echo "$resp" | tail -1)" "200"
 # the seller must NOT be able to cancel the buyer's order
@@ -207,21 +210,21 @@ pass "public + both private connections open, private feeds authenticated"
 # would emit nothing on any feed, making this check pass for the wrong reason.
 post "$API/deposits" '{"amount":1000,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 29" >/dev/null
 
-# A distinctive order (price 50, unused anywhere else in this script) so the
+# A distinctive order (price 83, unused anywhere else in this script) so the
 # resulting events are unambiguous.
-resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":50,"size":3}' \
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":83,"size":3}' \
   "Authorization: Bearer $TOK1" "X-Client-Order-Id: 30")
 assert_eq "ws-probe order accepted" "$(echo "$resp" | tail -1)" "200"
 wait "$WSPID"
 
 assert_eq "bad-token private connection closed" "$(jq '.badClosed' /tmp/smoke_ws.json)" "true"
 assert_eq "public feed saw the book delta" \
-  "$(jq '[.market[] | select(.type=="book_delta" and .price==50 and .qty==3)] | length' /tmp/smoke_ws.json)" "1"
+  "$(jq '[.market[] | select(.type=="book_delta" and .price==83 and .qty==3)] | length' /tmp/smoke_ws.json)" "1"
 assert_eq "buyer's private feed saw OrderAccepted" \
-  "$(jq '[.orders1[] | select(.OrderAccepted.price==50)] | length' /tmp/smoke_ws.json)" "1"
+  "$(jq '[.orders1[] | select(.OrderAccepted.price==83)] | length' /tmp/smoke_ws.json)" "1"
 # privacy: the seller's own private connection must never see the buyer's order.
 assert_eq "seller's private feed did NOT see buyer's order" \
-  "$(jq '[.orders2[] | select(.OrderAccepted.price==50)] | length' /tmp/smoke_ws.json)" "0"
+  "$(jq '[.orders2[] | select(.OrderAccepted.price==83)] | length' /tmp/smoke_ws.json)" "0"
 
 echo "== 15. pair delisting (M8) =="
 # USD-SOL was never traded (only checked as an empty book in step 13), so it's
@@ -246,7 +249,9 @@ assert_eq "delisting an already-unlisted pair 404s" "$code" "404"
 
 echo "== 16. market buy (M8) =="
 post "$API/deposits" '{"amount":3,"currency":"SOL"}' "Authorization: Bearer $TOK2" "X-Client-Order-Id: 300" >/dev/null
-code=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Ask","price":200,"size":3}' \
+# 110, not 200: the price band is ±20% of the last trade (100), so an ask out
+# at 200 is no longer placeable at all.
+code=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Ask","price":110,"size":3}' \
   "Authorization: Bearer $TOK2" "X-Client-Order-Id: 301" | tail -1)
 assert_eq "seller rests ask for market-buy test" "$code" "200"
 post "$API/deposits" '{"amount":600,"currency":"USD"}' "Authorization: Bearer $TOK1" "X-Client-Order-Id: 302" >/dev/null
@@ -254,7 +259,39 @@ resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Market","side":"Bid",
   "Authorization: Bearer $TOK1" "X-Client-Order-Id: 303")
 assert_eq "market buy accepted" "$(echo "$resp" | tail -1)" "200"
 assert_eq "market buy filled fully" "$(echo "$resp" | head -1 | jq .filled_qty)" "3"
-assert_eq "market buy charged the walked ask price" "$(echo "$resp" | head -1 | jq .total_cost)" "600"
+assert_eq "market buy charged the walked ask price" "$(echo "$resp" | head -1 | jq .total_cost)" "330"
+
+echo "== 17. abuse guards (deposit ceiling, price band, self-trade) =="
+resp=$(post "$API/deposits" '{"amount":999999999,"currency":"USD"}' \
+  "Authorization: Bearer $TOK1" "X-Client-Order-Id: 400")
+assert_eq "deposit past the ceiling rejected" "$(echo "$resp" | tail -1)" "400"
+assert_eq "  reason" "$(echo "$resp" | head -1 | jq -r .)" "DepositLimitExceeded"
+
+# A one-lot bid down at 10 costs nothing and would drag a wick onto the chart.
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":10,"size":1}' \
+  "Authorization: Bearer $TOK1" "X-Client-Order-Id: 401")
+assert_eq "lowball bid rejected" "$(echo "$resp" | tail -1)" "400"
+assert_eq "  reason" "$(echo "$resp" | head -1 | jq -r .)" "PriceOutOfBand"
+
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":100000,"size":1}' \
+  "Authorization: Bearer $TOK1" "X-Client-Order-Id: 402")
+assert_eq "moonshot bid rejected" "$(echo "$resp" | tail -1)" "400"
+
+# Same account on both sides of a cross is how you'd paint the tape.
+post "$API/deposits" '{"amount":5,"currency":"SOL"}'   "Authorization: Bearer $TOK2" "X-Client-Order-Id: 403" >/dev/null
+post "$API/deposits" '{"amount":1000,"currency":"USD"}' "Authorization: Bearer $TOK2" "X-Client-Order-Id: 404" >/dev/null
+code=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Ask","price":105,"size":2}' \
+  "Authorization: Bearer $TOK2" "X-Client-Order-Id: 405" | tail -1)
+assert_eq "seller rests an ask" "$code" "200"
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":105,"size":2}' \
+  "Authorization: Bearer $TOK2" "X-Client-Order-Id: 406")
+assert_eq "buying into your own ask rejected" "$(echo "$resp" | tail -1)" "400"
+assert_eq "  reason" "$(echo "$resp" | head -1 | jq -r .)" "SelfTrade"
+# ...but another account crossing the same ask is ordinary trading
+resp=$(post "$API/orders" '{"pair":"SOL-USD","order_type":"Limit","side":"Bid","price":105,"size":2}' \
+  "Authorization: Bearer $TOK1" "X-Client-Order-Id: 407")
+assert_eq "another account crosses it fine" "$(echo "$resp" | tail -1)" "200"
+assert_eq "  and fills" "$(echo "$resp" | head -1 | jq .filled_qty)" "2"
 
 echo
 echo "ALL CHECKS PASSED"
