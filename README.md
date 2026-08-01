@@ -24,8 +24,9 @@ and a Postgres-backed trade/order history, wired together over Redis Streams.
   book alive
 - Benchmark suite for the matching engine (`cargo bench`)
 
-Not yet built: structured logging/metrics, one engine per trading pair,
-Postgres retention.
+- Hourly Postgres retention sweep, so an always-on deployment stays bounded
+
+Not yet built: structured logging/metrics, one engine per trading pair.
 
 ## Architecture
 
@@ -40,7 +41,9 @@ Postgres retention.
   pub/sub. It also tails the event stream to keep an in-memory order-book
   projection and to fan events out to websocket clients.
 - **`db_writer`** tails the same event stream and projects trades, balances,
-  and orders into Postgres, one transaction per batch.
+  and orders into Postgres, one transaction per batch. It also sweeps old
+  rows hourly — a market maker reposting its quote ladder around the clock
+  otherwise writes a few hundred thousand order rows a day.
 - Every command is applied in strict log order, so replaying the log from
   the start always rebuilds the same state — the basis for crash recovery
   and for any fresh reader bootstrapping its own projection.

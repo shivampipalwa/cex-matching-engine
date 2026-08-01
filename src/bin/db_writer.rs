@@ -9,11 +9,102 @@ use redis::{
     streams::{StreamReadOptions, StreamReadReply},
 };
 use sqlx::{Postgres, Transaction};
-use std::error::Error;
+use std::{
+    error::Error,
+    time::{Duration, Instant},
+};
 
 /// Committed batches between trim attempts — the check costs a GET, so it
 /// isn't worth doing on every one.
 const TRIM_EVERY_BATCHES: u64 = 100;
+
+/// Rows per DELETE. Bounded so a sweep never takes a long lock on a table the
+/// API is reading.
+const RETENTION_BATCH: i64 = 5_000;
+/// Batches per sweep, so one pass can't stall event ingestion for minutes.
+/// Anything left over is picked up an hour later.
+const RETENTION_MAX_BATCHES: u32 = 20;
+const RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Terminal orders are the bulk of the growth — the market maker cancels and
+/// reposts its whole quote ladder every tick — and nobody is reading a
+/// week-old cancelled order.
+const DEFAULT_ORDER_RETENTION_DAYS: i32 = 7;
+/// Trades accumulate ~10x slower and are what the candle chart is drawn from,
+/// so they're kept far longer. Deleting them shortens the chart's history.
+const DEFAULT_TRADE_RETENTION_DAYS: i32 = 365;
+
+struct Retention {
+    order_days: i32,
+    trade_days: i32,
+}
+
+impl Retention {
+    /// 0 disables a sweep, so a deployment can opt out of either one.
+    fn from_env() -> Self {
+        let days = |key: &str, default: i32| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&d| d >= 0)
+                .unwrap_or(default)
+        };
+        Retention {
+            order_days: days("ORDER_RETENTION_DAYS", DEFAULT_ORDER_RETENTION_DAYS),
+            trade_days: days("TRADE_RETENTION_DAYS", DEFAULT_TRADE_RETENTION_DAYS),
+        }
+    }
+
+    async fn sweep(&self, pool: &sqlx::PgPool) -> Result<(), Box<dyn Error>> {
+        // ctid keeps the DELETE to the rows the LIMIT actually picked, instead
+        // of re-evaluating the predicate over the whole table.
+        let orders = prune(
+            pool,
+            "DELETE FROM orders WHERE ctid IN (
+               SELECT ctid FROM orders
+                WHERE status IN ('filled', 'cancelled')
+                  AND updated_at < now() - make_interval(days => $1)
+                LIMIT $2)",
+            self.order_days,
+        )
+        .await?;
+
+        let trades = prune(
+            pool,
+            "DELETE FROM trades WHERE ctid IN (
+               SELECT ctid FROM trades
+                WHERE created_at < now() - make_interval(days => $1)
+                LIMIT $2)",
+            self.trade_days,
+        )
+        .await?;
+
+        if orders > 0 || trades > 0 {
+            println!("Retention: pruned {orders} orders, {trades} trades");
+        }
+        Ok(())
+    }
+}
+
+async fn prune(pool: &sqlx::PgPool, sql: &str, days: i32) -> Result<u64, Box<dyn Error>> {
+    if days == 0 {
+        return Ok(0);
+    }
+    let mut total = 0;
+    for _ in 0..RETENTION_MAX_BATCHES {
+        let deleted = sqlx::query(sql)
+            .bind(days)
+            .bind(RETENTION_BATCH)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        total += deleted;
+        if (deleted as i64) < RETENTION_BATCH {
+            break;
+        }
+    }
+    Ok(total)
+}
 
 async fn ack_event(
     conn: &mut MultiplexedConnection,
@@ -181,7 +272,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut batches_since_trim = 0u64;
 
+    let retention = Retention::from_env();
+    println!(
+        "Retention: orders {} days, trades {} days (0 = keep)",
+        retention.order_days, retention.trade_days
+    );
+    // Sweep once at startup so a long-stopped deployment catches up rather
+    // than waiting an hour, then hourly.
+    let mut next_sweep = Instant::now();
+
     loop {
+        if Instant::now() >= next_sweep {
+            next_sweep = Instant::now() + RETENTION_INTERVAL;
+            if let Err(e) = retention.sweep(&pool).await {
+                // Never let a retention failure take down ingestion.
+                println!("Retention sweep failed: {e}");
+            }
+        }
+
         let reply: StreamReadReply = conn.xread_options(&["events"], &[">"], &opts).await?;
 
         // Events whose rows are staged in this batch's transaction; acked only

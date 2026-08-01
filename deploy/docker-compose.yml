@@ -73,6 +73,14 @@ services:
   db_writer:
     <<: *app
     command: ["db_writer"]
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/exchange
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_ACCOUNT_ID: ${ADMIN_ACCOUNT_ID:-1}
+      # 0 keeps rows forever
+      ORDER_RETENTION_DAYS: ${ORDER_RETENTION_DAYS:-7}
+      TRADE_RETENTION_DAYS: ${TRADE_RETENTION_DAYS:-365}
     depends_on:
       postgres:
         condition: service_healthy
