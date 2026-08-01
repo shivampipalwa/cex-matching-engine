@@ -154,6 +154,8 @@ docker compose up -d --build
 use `:80` to run without TLS. `FRONTEND_DIST` points at a built frontend
 (`npm run build`), mounted read-only.
 
+Step-by-step for a real box, DNS, and TLS: [`deploy/README.md`](./deploy/README.md).
+
 The `bot` service runs two fixed accounts — a maker resting quotes on both
 sides, and a taker crossing into them — so the book and the trade tape stay
 alive between visitors. Splitting the roles is what keeps it clear of the
