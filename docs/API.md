@@ -3,7 +3,13 @@
 Everything a frontend needs to talk to this backend. All shapes below were
 captured from the running system, not inferred from source.
 
-Base URL: `http://127.0.0.1:3000` (WebSocket: `ws://127.0.0.1:3000`)
+Base URL in development: `http://127.0.0.1:3000` (WebSocket: `ws://127.0.0.1:3000`).
+
+In a deployed stack Caddy serves the frontend and proxies the API under `/api`
+on the **same origin**, so the base is the relative `/api` and the WebSocket
+base is `wss://<host>/api`. Same origin means no CORS and no mixed content;
+it also means the frontend must not hardcode an absolute API host in a
+production build.
 
 ---
 
@@ -84,7 +90,26 @@ Returned as a bare JSON string in the `400` body:
 | `"InsufficientFunds"` | Not enough `available` balance to reserve |
 | `"InvalidPair"` | `base == quote`, or the pair isn't listed for trading |
 | `"InvalidAmount"` | `price × size` overflows `u64` |
+| `"DepositLimitExceeded"` | Deposit would push the holding past the per-currency ceiling |
+| `"PriceOutOfBand"` | Limit price more than ±20% from the last traded price |
+| `"SelfTrade"` | Order would match your own resting order |
 | `"UnsupportedOrderType"` | Currently unreachable |
+
+The last three are [abuse guards](#abuse-guards) — they only exist because this
+is a public demo where anyone can mint their own balance.
+
+#### Abuse guards
+
+| Guard | Rule | Applies to |
+|---|---|---|
+| Deposit ceiling | `available + reserved` after the deposit may not exceed **100,000 USD** or **1,000 SOL**. It caps the *holding*, not the request, so repeating the call doesn't help — but someone who trades their balance away can top back up. | `POST /deposits` |
+| Price band | A limit order must be within **±20%** of the market's last traded price. Unbounded until that market's first trade. | `POST /orders` (`Limit` only) |
+| Self-trade prevention | An order that would match the account's own resting order is rejected outright — the new order is never partially filled first. | `POST /orders` |
+
+Practical consequence for a client: a crossing **limit** order that isn't fully
+filled *rests* for the remainder. Place one on each side and every later order
+you send crosses your own book and gets `"SelfTrade"` forever. Use `Market` for
+taking, or cancel before flipping sides.
 
 ---
 
@@ -144,8 +169,11 @@ remainder.
 
 **`200`** → `{"available": 10000}` (new available balance, as a number)
 
+**`400`** `"DepositLimitExceeded"` · **`409`** · **`504`**
+
 A dev affordance — a real exchange credits deposits from an observed chain/bank
-event, never a client call.
+event, never a client call. Which is why it's capped: see
+[abuse guards](#abuse-guards).
 
 ### `POST /withdrawals` 🔒 + `X-Client-Order-Id`
 
