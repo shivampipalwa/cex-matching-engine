@@ -68,6 +68,11 @@ struct BookSnapshot {
     asks: Vec<BookLevel>,
 }
 
+#[derive(Deserialize)]
+struct Candle {
+    close: i64,
+}
+
 /// xorshift64. The bot only needs jitter, not statistical quality, and this
 /// avoids a dependency for it.
 struct Rng(u64);
@@ -205,6 +210,28 @@ impl Bot {
             .ok()?;
         resp.json::<BookSnapshot>().await.ok()
     }
+
+    /// Close of the most recent trade, for seeding `mid` on startup. `mid`
+    /// otherwise only updates from the *book*, which a fresh process hasn't
+    /// quoted into yet — and startup cleanup just cancelled whatever the
+    /// previous run left resting, so the book is briefly empty right when
+    /// this matters most. Restarting with a stale hardcoded guess instead of
+    /// the real last price risks every quote landing outside the price band
+    /// around wherever the market actually drifted to, and getting silently
+    /// rejected — a market that looks dead with no error anywhere.
+    async fn last_price(&self) -> Option<u64> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/candles/{}?interval=1s&limit=1",
+                self.base, self.pair
+            ))
+            .send()
+            .await
+            .ok()?;
+        let candles: Vec<Candle> = resp.json().await.ok()?;
+        candles.last().map(|c| c.close as u64)
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -285,8 +312,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Anchors the quotes. Re-derived from the book each tick, so the bot
-    // tracks where the market actually is rather than drifting on its own.
-    let mut mid: u64 = 100;
+    // tracks where the market actually is rather than drifting on its own —
+    // but the book has nothing in it yet this early (see last_price's doc
+    // comment), so the *first* value has to come from the real last trade,
+    // not a guess. 100 only survives as the fallback for a market that has
+    // genuinely never traded.
+    let mut mid: u64 = bot.last_price().await.unwrap_or(100);
     let mut resting: Vec<u64> = vec![];
     let mut ticks: u64 = 0;
     // -1, 0 or +1. Held across ticks and re-rolled occasionally, so both the
