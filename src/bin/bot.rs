@@ -14,9 +14,27 @@ use serde_json::json;
 use std::{error::Error, time::Duration};
 
 /// Quote levels per side.
-const LEVELS: u64 = 5;
+///
+/// The frontend's book panel sizes itself to fit however many levels the
+/// container has room for — usually well more than 5 — so a thin book here
+/// reads as "empty" even while the market is healthy, just because most of
+/// the panel's rows have nothing to show. Ceiling on pushing this higher is
+/// the price band: it rejects anything past ~20% of the last trade, and mid
+/// is clamped to [60, 160], so at the floor (mid=60) there's only ~12 ticks
+/// of room below before a deep bid starts getting silently rejected. 10
+/// levels (deepest bid at mid - (SPREAD + 9)) stays inside that with margin
+/// even at mid's lowest point.
+const LEVELS: u64 = 10;
 /// Gap between the maker's best bid and best ask, in price ticks.
-const SPREAD: u64 = 2;
+///
+/// Every taker print lands on one side of this spread or the other, so the
+/// spread — not the mid's drift — sets the amplitude of the noise on the
+/// chart. At 2 ticks around a mid near 60 that was a ~6% jump between
+/// consecutive prints, which swamped the ±1 mid walk entirely and rendered as
+/// static rather than a price. 1 tick halves the bounce; the mid still can't
+/// move far enough in one tick for the new quotes to cross the previous
+/// ones (see the re-quote comment in the main loop).
+const SPREAD: u64 = 1;
 /// Ticks between deposit top-ups. The engine's ceiling caps the holding, so an
 /// over-eager top-up just gets rejected — this only keeps the noise down.
 const TOPUP_EVERY: u64 = 25;
@@ -271,6 +289,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut mid: u64 = 100;
     let mut resting: Vec<u64> = vec![];
     let mut ticks: u64 = 0;
+    // -1, 0 or +1. Held across ticks and re-rolled occasionally, so both the
+    // mid walk and the taker's choice of side lean the same way for a while.
+    // Without it every print is an independent coin flip, which is why the
+    // chart read as noise: a market equally likely to go up or down on every
+    // single trade never produces the runs that make a price series look like
+    // a price series.
+    let mut trend: i64 = 0;
 
     println!("Quoting {pair} every {}ms", tick.as_millis());
     loop {
@@ -291,18 +316,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // ±1 with a flat patch, so the walk drifts instead of oscillating.
-        // Clamped well inside the engine's ±20% band around the last trade.
-        mid = match rng.below(4) {
-            0 => mid.saturating_sub(1),
-            1 => mid + 1,
-            _ => mid,
+        // Re-roll the trend now and then; otherwise let it run. One-in-six
+        // per tick gives runs averaging ~24s at the default 4s tick — long
+        // enough to be visible as a move, short enough that the chart isn't
+        // a straight line.
+        if rng.below(6) == 0 {
+            trend = match rng.below(3) {
+                0 => -1,
+                1 => 1,
+                _ => 0,
+            };
+        }
+
+        // Trend-weighted ±1 walk with a flat patch, so the walk drifts
+        // instead of oscillating. `up_chance` out of 6: a neutral trend keeps
+        // the original symmetric walk (2 up, 2 down, 2 flat), while a trend
+        // leans it 3-to-1 its way so the price actually travels somewhere
+        // over a minute. Clamped well inside the engine's ±20% band around
+        // the last trade.
+        let up_chance = (2 + trend) as u64;
+        let roll = rng.below(6);
+        mid = if roll < up_chance {
+            mid + 1
+        } else if roll < 4 {
+            mid.saturating_sub(1)
+        } else {
+            mid
         }
         .clamp(60, 160);
 
-        for order_id in std::mem::take(&mut resting) {
-            bot.cancel(&maker, order_id).await;
-        }
+        // Quote FIRST, then pull the previous quotes — never the other way
+        // round. Cancelling all ten resting orders before placing their
+        // replacements leaves the book with no levels at all for the width of
+        // an HTTP round trip, and since this maker is the only liquidity on
+        // the demo, that is a genuinely empty book. The public feed reports
+        // every one of those deltas faithfully, so any connected client
+        // watches the book empty and refill once per tick. Overlapping the
+        // two sets costs nothing (the new orders rest at the same prices the
+        // old ones did) and keeps depth continuously on screen.
+        let previous = std::mem::take(&mut resting);
 
         for i in 0..LEVELS {
             let size = 1 + rng.below(5);
@@ -317,14 +369,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Market, not limit. A crossing limit order that isn't fully filled
-        // RESTS, and once the taker has one resting on each side every later
-        // order crosses its own book and gets rejected as a self-trade — it
-        // wedges permanently. A market order's remainder is cancelled, so the
-        // taker never accumulates anything.
-        let side = if rng.below(2) == 0 { Side::Bid } else { Side::Ask };
-        bot.place(&taker, "Market", side, 0, 1 + rng.below(3)).await;
+        for order_id in previous {
+            bot.cancel(&maker, order_id).await;
+        }
 
-        tokio::time::sleep(tick).await;
+        // Several taker prints per tick, spread across it, rather than one
+        // print per tick fired in a burst. Two reasons:
+        //
+        //   - A single trade per bucket means open == high == low == close,
+        //     so every candle is a zero-height body that renders as a 1px
+        //     dash. A bucket needs more than one print before a candle has a
+        //     shape at all.
+        //   - At the default 4s tick, a 1s chart had a trade in one bucket
+        //     out of four and flat gap-fill in the rest. Spacing the prints
+        //     out puts a real trade in most buckets.
+        //
+        // The sleeps between prints are what pace the loop; the tick sleep
+        // that used to sit at the bottom is now distributed here.
+        let prints = 2 + rng.below(4);
+        let gap = tick / prints as u32;
+        for _ in 0..prints {
+            // Lean the same way as the trend, 3-to-1, so runs of buys or
+            // sells walk the price instead of alternating across the spread.
+            let bid_chance = (50 + trend * 25) as u64;
+            let side = if rng.below(100) < bid_chance {
+                Side::Bid
+            } else {
+                Side::Ask
+            };
+
+            // Market, not limit. A crossing limit order that isn't fully
+            // filled RESTS, and once the taker has one resting on each side
+            // every later order crosses its own book and gets rejected as a
+            // self-trade — it wedges permanently. A market order's remainder
+            // is cancelled, so the taker never accumulates anything.
+            bot.place(&taker, "Market", side, 0, 1 + rng.below(3)).await;
+            tokio::time::sleep(gap).await;
+        }
     }
 }

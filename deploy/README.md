@@ -160,7 +160,7 @@ is already listed.
 
 ```bash
 curl https://yourdomain.com/api/book/SOL-USD     # levels, growing as the bot works
-curl https://yourdomain.com/api/candles/SOL-USD?interval=1m
+curl https://yourdomain.com/api/candles/SOL-USD?interval=15m
 docker compose logs -f bot                       # a trade every few ticks
 ```
 
