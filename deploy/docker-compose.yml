@@ -1,6 +1,10 @@
 name: exchange
 
 x-app: &app
+  # image lets a box with tight RAM (e.g. a 1GB free-tier VM) `compose pull`
+  # a pre-built image instead of compiling the workspace locally — `build`
+  # stays too, so `compose build` still works for boxes with room to spare.
+  image: docker.io/shiv3am/cex-app:latest
   build:
     context: ..
     dockerfile: Dockerfile
