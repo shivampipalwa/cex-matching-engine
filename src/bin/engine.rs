@@ -1,4 +1,4 @@
-use matching_engine::{engine::run_engine, snapshot::SnapshotConfig, types::Engine};
+use matching_engine::{engine::Engine, runtime::run_engine, snapshot::SnapshotConfig};
 use std::error::Error;
 
 /// Commands between snapshots. Each one lets the `commands` stream be trimmed,

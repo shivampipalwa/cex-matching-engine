@@ -11,7 +11,11 @@ use axum::{
     },
     response::{IntoResponse, Response},
 };
-use matching_engine::types::{AccountId, Event, EventBatch, Pair, Side};
+use matching_engine::{
+    book::Side,
+    event::{Event, EventBatch},
+    market::{AccountId, Pair},
+};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::broadcast, time::timeout};
 

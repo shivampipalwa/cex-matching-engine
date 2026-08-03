@@ -13,15 +13,17 @@ use bigdecimal::BigDecimal;
 use futures_util::StreamExt;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use matching_engine::{
-    snapshot::SnapshotConfig,
-    types::{
-        AccountId, CancelRequest,
+    book::{OrderRequest, OrderType, Side},
+    command::{
+        CancelRequest,
         Command::{self},
         CommandEnvelope,
         CommandResponse::{self},
-        Currency, DepositRequest, EventBatch, OrderRequest, OrderType, Pair, ResponseEnvelope,
-        Side, WithdrawRequest,
+        DepositRequest, ResponseEnvelope, WithdrawRequest,
     },
+    event::EventBatch,
+    market::{AccountId, Currency, Pair},
+    snapshot::SnapshotConfig,
 };
 use redis::{AsyncCommands, Client, aio::MultiplexedConnection};
 use serde::{Deserialize, Serialize};

@@ -8,7 +8,11 @@
 //! It drives the same public HTTP API as any other client. Nothing here gets
 //! privileged access to the engine.
 
-use matching_engine::types::{Currency, Limits, Pair, Side};
+use matching_engine::{
+    book::Side,
+    engine::Limits,
+    market::{Currency, Pair},
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::{error::Error, time::Duration};

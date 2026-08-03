@@ -16,8 +16,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use matching_engine::{
+    book::Side,
+    event::{Event, EventBatch},
+    market::Pair,
     snapshot::{self, SnapshotConfig},
-    types::{Event, EventBatch, Pair, Side},
 };
 use redis::{
     AsyncCommands,

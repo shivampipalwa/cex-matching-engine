@@ -1,7 +1,8 @@
 use bigdecimal::BigDecimal;
 use matching_engine::{
+    book::{OrderType, Side},
+    event::{Event, EventBatch},
     snapshot,
-    types::{Event, EventBatch, OrderType, Side},
 };
 use redis::{
     AsyncCommands,

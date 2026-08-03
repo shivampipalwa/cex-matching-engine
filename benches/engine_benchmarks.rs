@@ -2,11 +2,10 @@
 // hop, so this isolates engine cost from transport cost.
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use matching_engine::engine::apply;
-use matching_engine::types::{
-    CancelRequest, Command, CommandResponse, Currency, DepositRequest, Engine, Limits, OrderRequest,
-    OrderType, Pair, Side,
-};
+use matching_engine::book::{OrderRequest, OrderType, Side};
+use matching_engine::command::{CancelRequest, Command, CommandResponse, DepositRequest};
+use matching_engine::engine::{Engine, Limits, apply};
+use matching_engine::market::{Currency, Pair};
 
 const PAIR: Pair = Pair {
     base: Currency::SOL,

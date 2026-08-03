@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use matching_engine::types::AccountId;
+use matching_engine::market::AccountId;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
