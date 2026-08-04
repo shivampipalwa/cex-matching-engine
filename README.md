@@ -4,30 +4,6 @@ A centralized exchange backend in Rust — a price-time matching engine, an
 accounts ledger, a REST API with JWT auth, public/private websocket feeds,
 and a Postgres-backed trade/order history, wired together over Redis Streams.
 
-## Status
-
-- Price-time matching engine — limit + market orders, partial fills, FIFO
-- Ledger with available/reserved balances (reserve → settle → refund → release)
-- Multiple trading pairs, admin-gated whitelist — nothing trades until listed
-- Three processes (`api`, `engine`, `db_writer`), decoupled over Redis Streams
-- Crash recovery via command-log replay
-- REST API with JWT auth; idempotent writes via `X-Client-Order-Id`
-- Full order lifecycle — place, cancel, deposit, withdraw any currency
-- Account-scoped reads off a Postgres projection
-- In-memory order-book projection with sequence-numbered snapshots
-- Public and private websocket feeds (book/trades, per-account order updates)
-- Overflow-checked order sizing, bounded idempotency-key memory
-- Abuse guards for a public deployment — deposit ceiling, price bands,
-  self-trade prevention
-- Periodic state snapshots, so recovery and stream trimming are both bounded
-- Deployable as one `docker compose` stack, with a market maker keeping the
-  book alive
-- Benchmark suite for the matching engine (`cargo bench`)
-
-- Hourly Postgres retention sweep, so an always-on deployment stays bounded
-
-Not yet built: structured logging/metrics, one engine per trading pair.
-
 ## Architecture
 
 ![Clients reach the API over HTTPS and WebSocket. Writes are XADDed to a Redis commands stream, consumed by a single matching engine, whose result is published back to the waiting API handler. The engine XADDs an events stream, which the DB Writer consumes via a consumer group into Postgres, and which the API tails with a plain XREAD to serve the in-memory book and the WebSocket feeds. Auth and account reads go straight from the API to Postgres.](./docs/architecture.svg)
@@ -55,17 +31,67 @@ Not yet built: structured logging/metrics, one engine per trading pair.
   written before the trim — the other order discards the history recovery
   needs.
 
+## Performance
+
+```bash
+cargo bench
+```
+
+[`benches/engine_benchmarks.rs`](./benches/engine_benchmarks.rs) calls the
+matching engine directly — no Redis, no HTTP — to measure the algorithm on
+its own. Median of 100 samples, one dev laptop:
+
+| Operation                            | Latency | Throughput     |
+| ------------------------------------ | ------- | -------------- |
+| Deposit                              | 316 ns  | ~3.2M/s        |
+| Place a resting limit order          | 594 ns  | ~1.7M/s        |
+| Place a crossing order (1 trade)     | 1.19 µs | ~840K/s        |
+| Cancel                               | 641 ns  | ~1.6M/s        |
+| Market buy sweeping 1,000 ask levels | 278 µs  | ~3.6M levels/s |
+
+Book depth barely matters — placing an order costs about the same at 10
+resting orders or 10,000, consistent with an O(log n) price-level index. A
+market order sweeping N levels is the one case that scales with N, which is
+expected: touching N levels means N fills, N trades, N book updates.
+
+These are the engine's floor, not what a client sees end to end — every real
+request still pays a Redis round trip on top.
+
+## Status
+
+- Price-time matching engine — limit + market orders, partial fills, FIFO
+- Ledger with available/reserved balances (reserve → settle → refund → release)
+- Multiple trading pairs, admin-gated whitelist — nothing trades until listed
+- Three processes (`api`, `engine`, `db_writer`), decoupled over Redis Streams
+- Crash recovery via command-log replay
+- REST API with JWT auth; idempotent writes via `X-Client-Order-Id`
+- Full order lifecycle — place, cancel, deposit, withdraw any currency
+- Account-scoped reads off a Postgres projection
+- In-memory order-book projection with sequence-numbered snapshots
+- Public and private websocket feeds (book/trades, per-account order updates)
+- Overflow-checked order sizing, bounded idempotency-key memory
+- Abuse guards for a public deployment — deposit ceiling, price bands,
+  self-trade prevention
+- Periodic state snapshots, so recovery and stream trimming are both bounded
+- Deployable as one `docker compose` stack, with a market maker keeping the
+  book alive
+- Benchmark suite for the matching engine (`cargo bench`)
+
+- Hourly Postgres retention sweep, so an always-on deployment stays bounded
+
+Not yet built: structured logging/metrics, one engine per trading pair.
+
 ## Abuse guards
 
 `POST /deposits` is an open faucet, which on a public URL means anyone can
 credit themselves whatever they like and flatten the book. Three guards, all
 enforced in the engine so they replay deterministically:
 
-| Guard | Rule |
-| --- | --- |
-| Deposit ceiling | Rejects a deposit that would push `available + reserved` past a per-currency ceiling. Caps the *holding*, not the request, so sending it twice doesn't help — and a visitor who loses money can still top back up. |
-| Price band | Rejects a limit order more than ±20% from the market's last traded price. Bounding balances bounds size but not placement: a one-lot bid at price 1 costs nothing and still puts a wick on the chart. |
-| Self-trade prevention | Rejects an order that would match the same account's resting order. Self-matching is the cheapest way to paint the tape. |
+| Guard                 | Rule                                                                                                                                                                                                               |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Deposit ceiling       | Rejects a deposit that would push `available + reserved` past a per-currency ceiling. Caps the _holding_, not the request, so sending it twice doesn't help — and a visitor who loses money can still top back up. |
+| Price band            | Rejects a limit order more than ±20% from the market's last traded price. Bounding balances bounds size but not placement: a one-lot bid at price 1 costs nothing and still puts a wick on the chart.              |
+| Self-trade prevention | Rejects an order that would match the same account's resting order. Self-matching is the cheapest way to paint the tape.                                                                                           |
 
 All three are configurable via `Engine.limits`; `Limits::none()` turns them off
 so the benchmarks measure matching rather than these checks.
@@ -188,41 +214,20 @@ ownership-checked cancellation, the book projection, both websocket feeds,
 the pair whitelist, and a market buy. Requires Node ≥ 22 in addition to
 Redis/Postgres/`sqlx-cli`/`jq`.
 
-## Performance
-
-```bash
-cargo bench
-```
-
-[`benches/engine_benchmarks.rs`](./benches/engine_benchmarks.rs) calls the
-matching engine directly — no Redis, no HTTP — to measure the algorithm on
-its own. Median of 100 samples, one dev laptop:
-
-| Operation                            | Latency | Throughput     |
-| ------------------------------------ | ------- | -------------- |
-| Deposit                              | 316 ns  | ~3.2M/s        |
-| Place a resting limit order          | 594 ns  | ~1.7M/s        |
-| Place a crossing order (1 trade)     | 1.19 µs | ~840K/s        |
-| Cancel                               | 641 ns  | ~1.6M/s        |
-| Market buy sweeping 1,000 ask levels | 278 µs  | ~3.6M levels/s |
-
-Book depth barely matters — placing an order costs about the same at 10
-resting orders or 10,000, consistent with an O(log n) price-level index. A
-market order sweeping N levels is the one case that scales with N, which is
-expected: touching N levels means N fills, N trades, N book updates.
-
-These are the engine's floor, not what a client sees end to end — every real
-request still pays a Redis round trip on top.
-
 ## Project layout
 
 ```
 src/
-├── types.rs         # wire + domain types: Order, Trade, Pair, Command/CommandResponse,
-│                     # Event/EventBatch, Engine/OrderBook, Ledger, Limits
-├── engine.rs         # OrderBook (matching), Ledger, Engine (orchestration), apply(),
-│                     # run_engine()/recover() (Redis loop + crash recovery), tests
-├── snapshot.rs       # save/load anchored to a stream id, XTRIM helpers
+├── market.rs      # AccountId, Currency, Pair
+├── error.rs       # RejectReason
+├── book.rs        # Order, Trade, OrderBook + the matching algorithm
+├── ledger.rs      # Balance, Ledger + reserve/release/settle
+├── command.rs     # Command/CommandResponse, envelopes, request types
+├── event.rs       # Event, EventBatch — the contract downstream readers consume
+├── engine.rs      # Engine, Limits, Dedup, apply() — command dispatch
+├── runtime.rs     # run_engine()/recover() — Redis consumer loop + crash recovery
+├── snapshot.rs    # save/load anchored to a stream id, XTRIM helpers
+├── test_util.rs   # shared test fixtures (cfg(test))
 ├── lib.rs
 └── bin/
     ├── engine.rs      # engine process: consumes `commands`, emits `events`
@@ -244,3 +249,9 @@ scripts/ws_smoke.mjs            # smoke.sh's websocket-feed helper (Node's globa
 scripts/seed.sh                 # one-off historical fill, for a chart with some past
 benches/engine_benchmarks.rs    # Criterion benchmarks against apply(), no transport
 ```
+
+Dependencies run one way — `market`/`error` → `book`/`ledger` → `engine` →
+`runtime` — and everything before `runtime` is free of Redis and tokio. The
+matching core is exercised end to end by `cargo test` without a transport
+anywhere in the picture; `runtime.rs` is the only module that knows a stream
+exists.

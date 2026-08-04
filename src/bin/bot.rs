@@ -42,6 +42,18 @@ const SPREAD: u64 = 1;
 /// Ticks between deposit top-ups. The engine's ceiling caps the holding, so an
 /// over-eager top-up just gets rejected — this only keeps the noise down.
 const TOPUP_EVERY: u64 = 25;
+/// Refresh both tokens well before the server's 24h TTL expires.
+///
+/// `post()` collapses every non-2xx into `None` — a 401 looks identical to a
+/// price-band rejection by the time anything here sees it, and every one of
+/// this bot's calls already treats a rejection as routine and silently moves
+/// on. So the token going stale mid-run wouldn't error, wouldn't log, and
+/// wouldn't crash — every subsequent tick would just quietly place nothing,
+/// forever, which is exactly what a market that looks dead with a perfectly
+/// healthy engine underneath looks like. Renewing proactively, well ahead of
+/// the deadline, sidesteps ever having to tell "expired" apart from
+/// "rejected" in the first place.
+const REAUTH_EVERY: Duration = Duration::from_secs(20 * 60 * 60);
 
 #[derive(Deserialize)]
 struct AuthResponse {
@@ -269,7 +281,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // compose starts us alongside the API, not after it's listening
     println!("Bot waiting for {base}");
-    let maker = loop {
+    let mut maker = loop {
         match bot.auth(&maker_email, &password).await {
             Ok(token) => break token,
             Err(e) => {
@@ -278,7 +290,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     };
-    let taker = bot.auth(&taker_email, &password).await?;
+    let mut taker = bot.auth(&taker_email, &password).await?;
+    let mut last_auth = std::time::Instant::now();
     println!("Bot authenticated as {maker_email} / {taker_email}");
 
     // Whoever signs up first is account 1 and therefore the admin. On a fresh
@@ -335,6 +348,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Quoting {pair} every {}ms", tick.as_millis());
     loop {
         ticks += 1;
+
+        // Only resets the clock on success — if the API happens to be
+        // unreachable right at the 20h mark, retry next tick rather than
+        // waiting another 20h with a token that's now overdue.
+        if last_auth.elapsed() >= REAUTH_EVERY {
+            let maker_ok = match bot.auth(&maker_email, &password).await {
+                Ok(token) => {
+                    maker = token;
+                    true
+                }
+                Err(e) => {
+                    println!("Maker re-auth failed ({e}), retrying next tick");
+                    false
+                }
+            };
+            let taker_ok = match bot.auth(&taker_email, &password).await {
+                Ok(token) => {
+                    taker = token;
+                    true
+                }
+                Err(e) => {
+                    println!("Taker re-auth failed ({e}), retrying next tick");
+                    false
+                }
+            };
+            if maker_ok && taker_ok {
+                last_auth = std::time::Instant::now();
+                println!("Re-authenticated {maker_email} / {taker_email}");
+            }
+        }
 
         if ticks % TOPUP_EVERY == 0 {
             for token in [maker.clone(), taker.clone()] {
