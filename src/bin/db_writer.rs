@@ -1,6 +1,7 @@
 use bigdecimal::BigDecimal;
 use matching_engine::{
     book::{OrderType, Side},
+    candle::INTERVAL_WIDTHS,
     event::{Event, EventBatch},
     snapshot,
 };
@@ -115,6 +116,18 @@ async fn ack_event(
     Ok(())
 }
 
+/// When the engine published the batch, in unix millis.
+///
+/// Redis stream ids are `<millis>-<seq>`, stamped at XADD — so this is match
+/// time, and it's part of the entry rather than regenerated, which means it
+/// survives replay unchanged. `now()` would instead be *db_writer's* clock at
+/// the moment it happened to process the entry: identical when keeping up,
+/// badly wrong when catching up on a backlog, where an hour of trades would
+/// all collapse into whichever bucket the replay landed in.
+fn entry_millis(entry_id: &str) -> Option<i64> {
+    entry_id.split_once('-')?.0.parse().ok()
+}
+
 /// Writes one event's rows. Every statement runs on `tx`, so nothing is visible
 /// to readers until the caller commits.
 async fn apply_event(
@@ -124,11 +137,26 @@ async fn apply_event(
 ) -> Result<(), sqlx::Error> {
     match event {
         Event::Trade(t) => {
-            sqlx::query(
+            let millis = entry_millis(entry_id).unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0)
+            });
+
+            // RETURNING turns the existing dedup guard into a signal: `Some`
+            // only when this row is new. The candle update below is a running
+            // `volume + qty`, which unlike the SETs everywhere else in this
+            // file is NOT idempotent — replaying an acked-but-uncommitted
+            // entry would double-count it. Gating on the insert means a
+            // redelivery skips both, and since they share `tx` the two can
+            // never disagree.
+            let inserted = sqlx::query_scalar::<_, String>(
                 "INSERT INTO trades
-                   (event_id, pair, price, qty, maker_id, taker_id, taker_side, maker_account, taker_account)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                 ON CONFLICT (event_id) DO NOTHING",
+                   (event_id, pair, price, qty, maker_id, taker_id, taker_side, maker_account, taker_account, created_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, to_timestamp($10::double precision / 1000.0))
+                 ON CONFLICT (event_id) DO NOTHING
+                 RETURNING event_id",
             )
             .bind(entry_id) // the events-stream id (idempotency key)
             .bind(t.pair.to_string())
@@ -142,8 +170,43 @@ async fn apply_event(
             })
             .bind(BigDecimal::from(t.maker_account))
             .bind(BigDecimal::from(t.taker_account))
-            .execute(&mut **tx)
+            .bind(millis)
+            .fetch_optional(&mut **tx)
             .await?;
+
+            if inserted.is_some() {
+                // One statement for all six widths: `unnest` turns the width
+                // list into rows, and integer division floors each to its
+                // bucket start.
+                //
+                // `open` is absent from the DO UPDATE on purpose — it keeps
+                // whatever the bucket's first trade inserted, while `close`
+                // takes every later one. That's the only part of this that
+                // depends on arrival order, and it holds because a
+                // single-threaded engine XADDs in match order and one
+                // db_writer consumes that stream in order. A second writer on
+                // the same group would split entries between consumers and
+                // could land them out of order — `high`/`low`/`volume` would
+                // survive that, `open`/`close` would not.
+                sqlx::query(
+                    "INSERT INTO candles
+                       (pair, interval_seconds, bucket, open, high, low, close, volume)
+                     SELECT $1, w, ($2::bigint / w) * w, $3, $3, $3, $3, $4
+                       FROM unnest($5::int[]) AS w
+                     ON CONFLICT (pair, interval_seconds, bucket) DO UPDATE SET
+                       high   = GREATEST(candles.high, EXCLUDED.high),
+                       low    = LEAST(candles.low, EXCLUDED.low),
+                       close  = EXCLUDED.close,
+                       volume = candles.volume + EXCLUDED.volume",
+                )
+                .bind(t.pair.to_string())
+                .bind(millis / 1000)
+                .bind(t.price as i64)
+                .bind(t.qty as i64)
+                .bind(&INTERVAL_WIDTHS[..])
+                .execute(&mut **tx)
+                .await?;
+            }
         }
         Event::BalanceChanged {
             account_id,
