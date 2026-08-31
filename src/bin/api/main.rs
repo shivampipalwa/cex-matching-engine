@@ -511,23 +511,29 @@ async fn get_candles(
         .unwrap_or(DEFAULT_CANDLES_LIMIT)
         .clamp(1, MAX_CANDLES_LIMIT);
 
+    // Reads db_writer's rollups instead of aggregating `trades`. The old query
+    // grouped the whole table before the LIMIT could apply, so asking for 24
+    // candles still scanned every trade ever recorded — 17s by the time the
+    // table reached 2M rows, and climbing. Here the PK
+    // (pair, interval_seconds, bucket) matches the shape of this query exactly:
+    // equality on the first two columns, then a backwards walk along the third
+    // that stops after `limit` rows. Cost is O(limit), not O(trades).
+    //
+    // `start`/`end` now filter on the bucket's own start rather than on
+    // individual trade timestamps, so a window slicing through the middle of a
+    // bucket excludes it rather than returning it partially aggregated. Whole
+    // buckets only — which is what a caller stitching a chart together wants.
     let rows = sqlx::query_as::<_, CandleRow>(
-        "SELECT bucket AS time, open, high, low, close, volume FROM (
-            SELECT
-                (floor(extract(epoch FROM created_at) / $2::double precision) * $2::double precision)::bigint AS bucket,
-                (array_agg(price ORDER BY created_at ASC))[1]::bigint AS open,
-                max(price)::bigint AS high,
-                min(price)::bigint AS low,
-                (array_agg(price ORDER BY created_at DESC))[1]::bigint AS close,
-                sum(qty)::bigint AS volume
-            FROM trades
-            WHERE pair = $1
-              AND ($3::bigint IS NULL OR extract(epoch FROM created_at) >= $3)
-              AND ($4::bigint IS NULL OR extract(epoch FROM created_at) < $4)
-            GROUP BY 1
-            ORDER BY bucket DESC
-            LIMIT $5
-        ) sub ORDER BY bucket ASC",
+        "SELECT time, open, high, low, close, volume FROM (
+            SELECT bucket AS time, open, high, low, close, volume
+              FROM candles
+             WHERE pair = $1
+               AND interval_seconds = $2
+               AND ($3::bigint IS NULL OR bucket >= $3)
+               AND ($4::bigint IS NULL OR bucket < $4)
+             ORDER BY bucket DESC
+             LIMIT $5
+        ) sub ORDER BY time ASC",
     )
     .bind(pair.to_string())
     .bind(seconds)
