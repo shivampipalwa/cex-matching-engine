@@ -1,4 +1,5 @@
 pub mod book;
+pub mod candle;
 pub mod command;
 pub mod engine;
 pub mod error;

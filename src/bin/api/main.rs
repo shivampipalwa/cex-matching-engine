@@ -14,6 +14,7 @@ use futures_util::StreamExt;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use matching_engine::{
     book::{OrderRequest, OrderType, Side},
+    candle::interval_seconds,
     command::{
         CancelRequest,
         Command::{self},
@@ -151,17 +152,6 @@ struct CandleRow {
     volume: i64,
 }
 
-fn interval_seconds(interval: &str) -> Option<i64> {
-    Some(match interval {
-        "1s" => 1,
-        "15m" => 900,
-        "1h" => 3600,
-        "4h" => 14400,
-        "1d" => 86400,
-        "1w" => 604800,
-        _ => return None,
-    })
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
