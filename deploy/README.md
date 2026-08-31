@@ -174,6 +174,9 @@ stack idling under a slow bot can sit under all three. Options, cheapest
 first:
 
 - Lower `BOT_TICK_MS` (e.g. `1500`) so CPU and network stay meaningfully busy.
+  Oracle-specific, and the opposite of what a small box wants — every tick is a
+  full quote ladder cancelled and reposted, so the tick rate sets how fast
+  `orders` and `trades` grow. On a 1GB/slow-disk VM raise it instead.
 - Provision 1 OCPU / 6 GB instead of 2/12 — same workload, higher percentages.
 - Upgrade the tenancy to Pay As You Go. Always Free resources stay free and
   reclamation no longer applies. Set a budget alert if you do this, since you

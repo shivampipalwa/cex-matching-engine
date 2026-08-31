@@ -258,9 +258,16 @@ A syntactically valid but never-traded pair returns `200` with empty sides.
 
 ### `GET /candles/:pair`
 
-Public, no auth. OHLCV candlesticks, aggregated on read from trade history —
-this is what you'd feed a charting library (TradingView's `lightweight-charts`
-accepts this shape close to as-is).
+Public, no auth. OHLCV candlesticks, read from rollups `db_writer` maintains as
+trades land — this is what you'd feed a charting library (TradingView's
+`lightweight-charts` accepts this shape close to as-is).
+
+Aggregating on read instead meant a `LIMIT` that applied only after the
+`GROUP BY`, so 24 candles cost a scan of every trade ever recorded. Cost is now
+proportional to `limit` rather than to history, and candles survive the pruning
+of the trades they came from. `1s` is the one width with its own retention
+(`CANDLE_1S_RETENTION_DAYS`, default 2 days); everything coarser is kept
+indefinitely.
 
 Query:
 
