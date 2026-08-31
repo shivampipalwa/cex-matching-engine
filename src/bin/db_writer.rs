@@ -32,13 +32,21 @@ const RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
 /// reposts its whole quote ladder every tick — and nobody is reading a
 /// week-old cancelled order.
 const DEFAULT_ORDER_RETENTION_DAYS: i32 = 7;
-/// Trades accumulate ~10x slower and are what the candle chart is drawn from,
-/// so they're kept far longer. Deleting them shortens the chart's history.
+/// Trades accumulate ~10x slower than orders. They're no longer what the chart
+/// is drawn from — `candles` is — so this now only bounds how far back a
+/// backfill or an ad-hoc query could reach, not the chart's history.
 const DEFAULT_TRADE_RETENTION_DAYS: i32 = 365;
+/// Only the 1s candles need pruning: 86,400 rows/day/pair against 96 for 15m
+/// and 24 for 1h, so every coarser width is small enough to keep indefinitely
+/// (a decade of 1h candles is ~88k rows). Nobody charts second-by-second
+/// activity from last month, and keeping it would cost more than the entire
+/// rest of the table.
+const DEFAULT_CANDLE_1S_RETENTION_DAYS: i32 = 2;
 
 struct Retention {
     order_days: i32,
     trade_days: i32,
+    candle_1s_days: i32,
 }
 
 impl Retention {
@@ -54,6 +62,10 @@ impl Retention {
         Retention {
             order_days: days("ORDER_RETENTION_DAYS", DEFAULT_ORDER_RETENTION_DAYS),
             trade_days: days("TRADE_RETENTION_DAYS", DEFAULT_TRADE_RETENTION_DAYS),
+            candle_1s_days: days(
+                "CANDLE_1S_RETENTION_DAYS",
+                DEFAULT_CANDLE_1S_RETENTION_DAYS,
+            ),
         }
     }
 
@@ -81,8 +93,22 @@ impl Retention {
         )
         .await?;
 
-        if orders > 0 || trades > 0 {
-            println!("Retention: pruned {orders} orders, {trades} trades");
+        // Bucket is epoch seconds, so the cutoff is arithmetic rather than a
+        // timestamp comparison — and idx_candles_interval_bucket leads on
+        // interval_seconds, which the PK can't do since `pair` leads it.
+        let candles = prune(
+            pool,
+            "DELETE FROM candles WHERE ctid IN (
+               SELECT ctid FROM candles
+                WHERE interval_seconds = 1
+                  AND bucket < extract(epoch FROM now() - make_interval(days => $1))
+                LIMIT $2)",
+            self.candle_1s_days,
+        )
+        .await?;
+
+        if orders > 0 || trades > 0 || candles > 0 {
+            println!("Retention: pruned {orders} orders, {trades} trades, {candles} 1s candles");
         }
         Ok(())
     }
